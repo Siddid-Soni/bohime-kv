@@ -4,8 +4,11 @@
 
 use std::collections::HashMap;
 
+pub(crate) type SegmentId = u32;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ValueLoc {
+    pub(crate) segment_id: SegmentId,
     pub(crate) offset: u64,
     pub(crate) len: u32,
 }
@@ -68,7 +71,7 @@ mod tests {
     #[test]
     fn get_after_insert_returns_loc() {
         let mut index = HashMapIndex::default();
-        let loc = ValueLoc { offset: 10, len: 5 };
+        let loc = ValueLoc { segment_id: 0, offset: 10, len: 5 };
 
         index.insert(b"k".to_vec(), loc);
 
@@ -84,7 +87,7 @@ mod tests {
     #[test]
     fn remove_deletes_entry_and_returns_it() {
         let mut index = HashMapIndex::default();
-        let loc = ValueLoc { offset: 10, len: 5 };
+        let loc = ValueLoc { segment_id: 0, offset: 10, len: 5 };
         index.insert(b"k".to_vec(), loc);
 
         let removed = index.remove(b"k");
@@ -96,8 +99,8 @@ mod tests {
     #[test]
     fn relocate_applies_when_old_loc_matches() {
         let mut index = HashMapIndex::default();
-        let old = ValueLoc { offset: 10, len: 5 };
-        let new = ValueLoc { offset: 100, len: 5 };
+        let old = ValueLoc { segment_id: 0, offset: 10, len: 5 };
+        let new = ValueLoc { segment_id: 0, offset: 100, len: 5 };
         index.insert(b"k".to_vec(), old);
 
         let applied = index.relocate(b"k", old, new);
@@ -111,9 +114,9 @@ mod tests {
         // Simulates: compaction read `old`, but the key was overwritten to
         // `current` in the meantime. The relocation must not clobber that.
         let mut index = HashMapIndex::default();
-        let old = ValueLoc { offset: 10, len: 5 };
-        let current = ValueLoc { offset: 200, len: 7 };
-        let compaction_target = ValueLoc { offset: 100, len: 5 };
+        let old = ValueLoc { segment_id: 0, offset: 10, len: 5 };
+        let current = ValueLoc { segment_id: 0, offset: 200, len: 7 };
+        let compaction_target = ValueLoc { segment_id: 0, offset: 100, len: 5 };
         index.insert(b"k".to_vec(), current);
 
         let applied = index.relocate(b"k", old, compaction_target);
@@ -125,8 +128,8 @@ mod tests {
     #[test]
     fn iter_yields_all_entries() {
         let mut index = HashMapIndex::default();
-        index.insert(b"a".to_vec(), ValueLoc { offset: 0, len: 1 });
-        index.insert(b"b".to_vec(), ValueLoc { offset: 1, len: 2 });
+        index.insert(b"a".to_vec(), ValueLoc { segment_id: 0, offset: 0, len: 1 });
+        index.insert(b"b".to_vec(), ValueLoc { segment_id: 0, offset: 1, len: 2 });
 
         let mut entries = index.iter();
         entries.sort_by(|a, b| a.0.cmp(&b.0));
@@ -134,8 +137,8 @@ mod tests {
         assert_eq!(
             entries,
             vec![
-                (b"a".to_vec(), ValueLoc { offset: 0, len: 1 }),
-                (b"b".to_vec(), ValueLoc { offset: 1, len: 2 }),
+                (b"a".to_vec(), ValueLoc { segment_id: 0, offset: 0, len: 1 }),
+                (b"b".to_vec(), ValueLoc { segment_id: 0, offset: 1, len: 2 }),
             ]
         );
     }
