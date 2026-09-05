@@ -1,0 +1,44 @@
+syntax = "proto3";
+package ferrokv.admin;
+
+// Cluster administration. Filled in starting at M9/M10/M12.
+
+service AdminService {
+  rpc AddNode(AddNodeRequest) returns (AddNodeResponse);
+  rpc RemoveNode(RemoveNodeRequest) returns (RemoveNodeResponse);
+  rpc ClusterStatus(ClusterStatusRequest) returns (ClusterStatusResponse);
+  rpc Rebalance(RebalanceRequest) returns (RebalanceResponse);
+  rpc VerifyShard(VerifyShardRequest) returns (VerifyShardResponse);
+}
+
+message AddNodeRequest {
+  uint64 node_id = 1;
+  string address = 2;
+}
+message AddNodeResponse {}
+
+message RemoveNodeRequest {
+  uint64 node_id = 1;
+}
+message RemoveNodeResponse {}
+
+message ClusterStatusRequest {}
+message ClusterStatusResponse {
+  repeated ShardStatus shards = 1;
+}
+message ShardStatus {
+  uint32 shard_id = 1;
+  uint64 leader_id = 2;
+  repeated uint64 replicas = 3;
+}
+
+message RebalanceRequest {}
+message RebalanceResponse {}
+
+message VerifyShardRequest {
+  uint32 shard_id = 1;
+}
+message VerifyShardResponse {
+  bool consistent = 1;
+  repeated bytes divergent_key_ranges = 2;
+}

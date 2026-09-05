@@ -1,0 +1,60 @@
+syntax = "proto3";
+package ferrokv.kv;
+
+// Client-facing API. Filled in starting at M6.
+
+service KvService {
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Put(PutRequest) returns (PutResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc Cas(CasRequest) returns (CasResponse);
+}
+
+message ClientContext {
+  uint64 client_id = 1;
+  uint64 sequence_number = 2;
+}
+
+message NotLeader {
+  uint64 leader_hint = 1;
+}
+
+message GetRequest {
+  bytes key = 1;
+}
+
+message GetResponse {
+  optional bytes value = 1;
+  optional NotLeader not_leader = 2;
+}
+
+message PutRequest {
+  ClientContext ctx = 1;
+  bytes key = 2;
+  bytes value = 3;
+}
+
+message PutResponse {
+  optional NotLeader not_leader = 1;
+}
+
+message DeleteRequest {
+  ClientContext ctx = 1;
+  bytes key = 2;
+}
+
+message DeleteResponse {
+  optional NotLeader not_leader = 1;
+}
+
+message CasRequest {
+  ClientContext ctx = 1;
+  bytes key = 2;
+  optional bytes expected = 3;
+  bytes new_value = 4;
+}
+
+message CasResponse {
+  bool swapped = 1;
+  optional NotLeader not_leader = 2;
+}
