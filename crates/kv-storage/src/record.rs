@@ -1,4 +1,6 @@
-const HEADER_LEN: usize = 4 + 8 + 4 + 4; // crc + timestamp + key_len + value_len
+// crc + timestamp + flags + key_len + value_len
+const HEADER_LEN: usize = 4 + 8 + 1 + 4 + 4;
+const FLAG_TOMBSTONE: u8 = 0x01;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum CodecError {
@@ -12,15 +14,19 @@ pub(crate) enum CodecError {
 pub(crate) struct Record {
     crc: u32,
     timestamp: u64,
-    key: Vec<u8>,
+    pub(crate) is_tombstone: bool,
+    pub(crate) key: Vec<u8>,
     pub(crate) value: Vec<u8>,
 }
 
 /// CRC32 over everything the header covers except the CRC field itself:
-/// timestamp | key_len | value_len | key | value.
-fn checksum(timestamp: u64, key: &[u8], value: &[u8]) -> u32 {
+/// timestamp | flags | key_len | value_len | key | value. The tombstone
+/// flag is included so a corrupted flag byte is caught rather than silently
+/// resurrecting or deleting the wrong thing.
+fn checksum(timestamp: u64, is_tombstone: bool, key: &[u8], value: &[u8]) -> u32 {
     let mut hasher = crc32fast::Hasher::new();
     hasher.update(&timestamp.to_be_bytes());
+    hasher.update(&[is_tombstone as u8]);
     hasher.update(&(key.len() as u32).to_be_bytes());
     hasher.update(&(value.len() as u32).to_be_bytes());
     hasher.update(key);
@@ -33,8 +39,8 @@ impl Record {
     /// crc, for tests that need to check raw byte layout or corruption
     /// handling independent of `create`'s checksum computation.
     #[cfg(test)]
-    fn new(crc: u32, timestamp: u64, key: Vec<u8>, value: Vec<u8>) -> Self {
-        Self { crc, timestamp, key, value }
+    fn new(crc: u32, timestamp: u64, is_tombstone: bool, key: Vec<u8>, value: Vec<u8>) -> Self {
+        Self { crc, timestamp, is_tombstone, key, value }
     }
 
     /// Builds a record with a correctly computed checksum. This is the
@@ -42,16 +48,27 @@ impl Record {
     /// that deliberately need to construct a record with a specific
     /// (possibly wrong) crc.
     pub(crate) fn create(timestamp: u64, key: Vec<u8>, value: Vec<u8>) -> Self {
-        let crc = checksum(timestamp, &key, &value);
-        Self { crc, timestamp, key, value }
+        let crc = checksum(timestamp, false, &key, &value);
+        Self { crc, timestamp, is_tombstone: false, key, value }
+    }
+
+    /// Builds a delete marker: no value is stored, and replay (M1.3) removes
+    /// `key` from the keydir instead of inserting it.
+    pub(crate) fn tombstone(timestamp: u64, key: Vec<u8>) -> Self {
+        let value = Vec::new();
+        let crc = checksum(timestamp, true, &key, &value);
+        Self { crc, timestamp, is_tombstone: true, key, value }
     }
 
     pub(crate) fn encode(&self) -> Vec<u8> {
         let crc_bytes = self.crc.to_be_bytes();
         let timestamp_bytes = self.timestamp.to_be_bytes();
+        let flags = if self.is_tombstone { FLAG_TOMBSTONE } else { 0 };
         let len_key: [u8; 4] = (self.key.len() as u32).to_be_bytes();
         let len_value: [u8; 4] = (self.value.len() as u32).to_be_bytes();
-        let mut res = [&crc_bytes[..], &timestamp_bytes[..], &len_key[..], &len_value[..]].concat();
+        let mut res =
+            [&crc_bytes[..], &timestamp_bytes[..], &[flags][..], &len_key[..], &len_value[..]]
+                .concat();
         res.append(&mut self.key.clone());
         res.append(&mut self.value.clone());
         res
@@ -67,8 +84,9 @@ impl Record {
 
         let crc = u32::from_be_bytes(data[0..4].try_into().unwrap());
         let timestamp = u64::from_be_bytes(data[4..12].try_into().unwrap());
-        let key_len = u32::from_be_bytes(data[12..16].try_into().unwrap()) as usize;
-        let value_len = u32::from_be_bytes(data[16..20].try_into().unwrap()) as usize;
+        let is_tombstone = data[12] & FLAG_TOMBSTONE != 0;
+        let key_len = u32::from_be_bytes(data[13..17].try_into().unwrap()) as usize;
+        let value_len = u32::from_be_bytes(data[17..21].try_into().unwrap()) as usize;
 
         let total_len = HEADER_LEN + key_len + value_len;
         if data.len() < total_len {
@@ -78,12 +96,12 @@ impl Record {
         let key = data[HEADER_LEN..HEADER_LEN + key_len].to_vec();
         let value = data[HEADER_LEN + key_len..total_len].to_vec();
 
-        let computed = checksum(timestamp, &key, &value);
+        let computed = checksum(timestamp, is_tombstone, &key, &value);
         if computed != crc {
             return Err(CodecError::ChecksumMismatch { expected: crc, computed });
         }
 
-        Ok((Self { crc, timestamp, key, value }, total_len))
+        Ok((Self { crc, timestamp, is_tombstone, key, value }, total_len))
     }
 }
 
@@ -91,13 +109,14 @@ impl Record {
 fn encode_record() {
     let key = b"foo".to_vec();
     let value = b"bard".to_vec();
-    let record = Record::new(0xDEADBEEF, 42, key.clone(), value.clone());
+    let record = Record::new(0xDEADBEEF, 42, false, key.clone(), value.clone());
 
     let encoded = record.encode();
 
     let mut expected = Vec::new();
     expected.extend_from_slice(&0xDEADBEEFu32.to_be_bytes());
     expected.extend_from_slice(&42u64.to_be_bytes());
+    expected.push(0); // flags: not a tombstone
     expected.extend_from_slice(&(key.len() as u32).to_be_bytes());
     expected.extend_from_slice(&(value.len() as u32).to_be_bytes());
     expected.extend_from_slice(&key);
@@ -107,12 +126,21 @@ fn encode_record() {
 }
 
 #[test]
+fn encode_tombstone_sets_flag_byte() {
+    let record = Record::new(0xDEADBEEF, 42, true, b"foo".to_vec(), Vec::new());
+
+    let encoded = record.encode();
+
+    assert_eq!(encoded[12], FLAG_TOMBSTONE);
+}
+
+#[test]
 fn create_computes_matching_checksum() {
     let key = b"foo".to_vec();
     let value = b"bard".to_vec();
     let record = Record::create(42, key.clone(), value.clone());
 
-    assert_eq!(record.crc, checksum(42, &key, &value));
+    assert_eq!(record.crc, checksum(42, false, &key, &value));
 }
 
 #[test]
@@ -144,6 +172,19 @@ fn decode_rejects_truncated_body() {
 
     let err = Record::decode(&encoded).unwrap_err();
     assert!(matches!(err, CodecError::Truncated { .. }));
+}
+
+#[test]
+fn tombstone_round_trips() {
+    let record = Record::tombstone(42, b"k".to_vec());
+
+    let encoded = record.encode();
+    let (decoded, consumed) = Record::decode(&encoded).unwrap();
+
+    assert!(decoded.is_tombstone);
+    assert_eq!(decoded.key, b"k".to_vec());
+    assert_eq!(decoded.value, Vec::<u8>::new());
+    assert_eq!(consumed, encoded.len());
 }
 
 #[test]

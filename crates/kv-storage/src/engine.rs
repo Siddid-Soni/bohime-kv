@@ -1,34 +1,62 @@
-//! Append-only Bitcask engine (M1.2). Single active file, in-memory index —
-//! no rebuild-on-reopen (M1.3), rotation (M1.4), or compaction (M1.5) yet.
+//! Append-only Bitcask engine (M1.2/M1.3). Single active file; the keydir is
+//! rebuilt on open by replaying the log, and deletes persist as tombstones
+//! so they survive a reopen. No rotation (M1.4) or compaction (M1.5) yet.
 
-use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::index::{HashMapIndex, KeyDirIndex, ValueLoc};
 use crate::record::Record;
-
-struct ValueLoc {
-    offset: u64,
-    len: u32,
-}
 
 pub struct Engine {
     file: File,
     write_offset: u64,
-    index: HashMap<Vec<u8>, ValueLoc>,
+    index: HashMapIndex,
 }
 
 fn now_millis() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
 }
 
+/// Rebuilds the keydir by decoding every record from the start of the file.
+/// A tombstone removes its key from the index instead of inserting it;
+/// whichever record for a key comes last in the file wins, which is exactly
+/// what a fresh in-order replay produces naturally. Returns the offset one
+/// past the last record, i.e. where the next `put`/`delete` should append.
+fn replay(mut file: &File, index: &mut HashMapIndex) -> io::Result<u64> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)?;
+
+    let mut offset = 0u64;
+    let mut rest = &buf[..];
+    while !rest.is_empty() {
+        let (record, consumed) =
+            Record::decode(rest).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        if record.is_tombstone {
+            index.remove(&record.key);
+        } else {
+            index.insert(record.key.clone(), ValueLoc { offset, len: consumed as u32 });
+        }
+
+        offset += consumed as u64;
+        rest = &rest[consumed..];
+    }
+
+    Ok(offset)
+}
+
 impl Engine {
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let file = OpenOptions::new().create(true).read(true).append(true).open(path)?;
-        let write_offset = file.metadata()?.len();
-        Ok(Self { file, write_offset, index: HashMap::new() })
+
+        let mut index = HashMapIndex::default();
+        let write_offset = replay(&file, &mut index)?;
+
+        Ok(Self { file, write_offset, index })
     }
 
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> io::Result<()> {
@@ -57,10 +85,14 @@ impl Engine {
         Ok(Some(record.value))
     }
 
-    /// Removes `key` from the in-memory index. Note: this does not yet
-    /// persist a tombstone to the log, so a deleted key reappears after
-    /// reopen — that gap closes in M1.3, where replay-on-reopen needs it.
+    /// Writes a tombstone record so the deletion survives reopen, then
+    /// removes `key` from the in-memory index.
     pub fn delete(&mut self, key: &[u8]) -> io::Result<()> {
+        let record = Record::tombstone(now_millis(), key.to_vec());
+        let encoded = record.encode();
+        self.file.write_all(&encoded)?;
+        self.write_offset += encoded.len() as u64;
+
         self.index.remove(key);
         Ok(())
     }
@@ -89,6 +121,93 @@ mod tests {
         engine.put(b"k", b"v2").unwrap();
 
         assert_eq!(engine.get(b"k").unwrap(), Some(b"v2".to_vec()));
+    }
+
+    #[test]
+    fn reopen_replays_existing_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.log");
+
+        let mut engine = Engine::open(&path).unwrap();
+        engine.put(b"k1", b"v1").unwrap();
+        engine.put(b"k2", b"v2").unwrap();
+        drop(engine);
+
+        let mut reopened = Engine::open(&path).unwrap();
+        assert_eq!(reopened.get(b"k1").unwrap(), Some(b"v1".to_vec()));
+        assert_eq!(reopened.get(b"k2").unwrap(), Some(b"v2".to_vec()));
+    }
+
+    #[test]
+    fn reopen_replays_overwrite_as_latest_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.log");
+
+        let mut engine = Engine::open(&path).unwrap();
+        engine.put(b"k", b"v1").unwrap();
+        engine.put(b"k", b"v2").unwrap();
+        drop(engine);
+
+        let mut reopened = Engine::open(&path).unwrap();
+        assert_eq!(reopened.get(b"k").unwrap(), Some(b"v2".to_vec()));
+    }
+
+    #[test]
+    fn reopen_after_delete_stays_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.log");
+
+        let mut engine = Engine::open(&path).unwrap();
+        engine.put(b"k", b"v").unwrap();
+        engine.delete(b"k").unwrap();
+        drop(engine);
+
+        let mut reopened = Engine::open(&path).unwrap();
+        assert_eq!(reopened.get(b"k").unwrap(), None);
+    }
+
+    #[test]
+    fn writes_after_reopen_append_correctly() {
+        // Guards against replay leaving write_offset pointing at the wrong
+        // place, which would silently corrupt the first post-reopen write.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.log");
+
+        let mut engine = Engine::open(&path).unwrap();
+        engine.put(b"k1", b"v1").unwrap();
+        drop(engine);
+
+        let mut reopened = Engine::open(&path).unwrap();
+        reopened.put(b"k2", b"v2").unwrap();
+
+        assert_eq!(reopened.get(b"k1").unwrap(), Some(b"v1".to_vec()));
+        assert_eq!(reopened.get(b"k2").unwrap(), Some(b"v2".to_vec()));
+
+        drop(reopened);
+        let mut reopened_again = Engine::open(&path).unwrap();
+        assert_eq!(reopened_again.get(b"k1").unwrap(), Some(b"v1".to_vec()));
+        assert_eq!(reopened_again.get(b"k2").unwrap(), Some(b"v2".to_vec()));
+    }
+
+    #[test]
+    fn write_10k_keys_drop_reopen_all_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.log");
+
+        let mut engine = Engine::open(&path).unwrap();
+        for i in 0..10_000u32 {
+            let key = format!("key-{i}").into_bytes();
+            let value = format!("value-{i}").into_bytes();
+            engine.put(&key, &value).unwrap();
+        }
+        drop(engine);
+
+        let mut reopened = Engine::open(&path).unwrap();
+        for i in 0..10_000u32 {
+            let key = format!("key-{i}").into_bytes();
+            let expected = format!("value-{i}").into_bytes();
+            assert_eq!(reopened.get(&key).unwrap(), Some(expected));
+        }
     }
 
     #[test]
