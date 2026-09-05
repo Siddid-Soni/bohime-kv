@@ -2,7 +2,7 @@
 //! retry with backoff). Wiring begins at M6/M13.
 
 fn main() {
-    println!("ferrokv kv-client placeholder — implementation begins at M6");
+    println!("bohime kv-client placeholder — implementation begins at M6");
 }
 
 #[cfg(test)]

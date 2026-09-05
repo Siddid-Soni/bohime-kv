@@ -2,7 +2,7 @@
 //! real tokio/tonic I/O. Wiring begins at M6.
 
 fn main() {
-    println!("ferrokv kv-node placeholder — implementation begins at M6");
+    println!("bohime kv-node placeholder — implementation begins at M6");
 }
 
 #[cfg(test)]

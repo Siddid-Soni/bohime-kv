@@ -1,4 +1,4 @@
-# FerroKV
+# Bohime
 
 A sharded, Raft-replicated key-value store in Rust, over gRPC.
 

@@ -1,5 +1,5 @@
 syntax = "proto3";
-package ferrokv.raft;
+package bohime.raft;
 
 // Node-to-node consensus RPCs. See docs/superpowers/specs (or the design
 // plan) for the semantics of each field — this file is intentionally a

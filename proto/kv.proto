@@ -1,5 +1,5 @@
 syntax = "proto3";
-package ferrokv.kv;
+package bohime.kv;
 
 // Client-facing API. Filled in starting at M6.
 

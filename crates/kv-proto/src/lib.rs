@@ -1,4 +1,4 @@
-//! Generated gRPC/protobuf types for FerroKV, compiled from `proto/*.proto`
+//! Generated gRPC/protobuf types for Bohime, compiled from `proto/*.proto`
 //! by `build.rs`. This crate is codegen only — no hand-written logic.
 
 // tonic-build's generated client methods return `tonic::Status` as the Err
@@ -8,15 +8,15 @@
 #![allow(clippy::result_large_err)]
 
 pub mod raft {
-    tonic::include_proto!("ferrokv.raft");
+    tonic::include_proto!("bohime.raft");
 }
 
 pub mod kv {
-    tonic::include_proto!("ferrokv.kv");
+    tonic::include_proto!("bohime.kv");
 }
 
 pub mod admin {
-    tonic::include_proto!("ferrokv.admin");
+    tonic::include_proto!("bohime.admin");
 }
 
 #[cfg(test)]

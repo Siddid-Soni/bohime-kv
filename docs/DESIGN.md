@@ -1,4 +1,4 @@
-# FerroKV — a sharded, Raft-replicated key-value store in Rust over gRPC
+# Bohime — a sharded, Raft-replicated key-value store in Rust over gRPC
 
 ## Context
 
@@ -16,9 +16,7 @@ The decided shape (from your answers):
 - **Own Bitcask-style storage engine** — append-only segments, in-memory keydir,
   compaction. A second independent resume bullet.
 
-Nothing exists yet. `/home/siddid/Projects` contains only an unrelated project
-(`tailrace`). Target directory: `/home/siddid/Projects/ferrokv` (name is easy to
-change before M0; it appears in crate names and the git remote).
+Project directory: `/home/siddid/Projects/bohime`.
 
 Outcome: a cluster you can start with one command, that survives killing a node
 mid-write, that passes a linearizability check under fault injection, and that
@@ -521,7 +519,7 @@ Crate layout — the boundaries matter, because they are what make each piece
 testable in isolation:
 
 ```
-ferrokv/
+bohime/
 ├── Cargo.toml                 # workspace
 ├── proto/                     # .proto files (single source of truth)
 ├── crates/
@@ -762,7 +760,7 @@ after any of M6, M9, or M13 yields something coherent to show.
 Everything needed is already installed: `cargo`/`rustc` 1.98.0, `protoc` 35.1,
 `git`, `docker`, 20 cores. Steps:
 
-1. `mkdir -p /home/siddid/Projects/ferrokv && git init`
+1. `mkdir -p /home/siddid/Projects/bohime && git init`
 2. Workspace `Cargo.toml` with `members = ["crates/*"]`, a shared
    `[workspace.dependencies]` block, and `resolver = "3"`.
 3. Seven crates via `cargo new --lib` (plus `--bin` for `kv-node` and

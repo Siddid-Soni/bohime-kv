@@ -1,5 +1,5 @@
 syntax = "proto3";
-package ferrokv.admin;
+package bohime.admin;
 
 // Cluster administration. Filled in starting at M9/M10/M12.
 
