@@ -9,11 +9,3 @@ mod index;
 mod record;
 
 pub use engine::Engine;
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_wires_up() {
-        assert_eq!(2 + 2, 4);
-    }
-}
