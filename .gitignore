@@ -4,3 +4,5 @@ Cargo.lock
 .DS_Store
 /data/
 *.bohime
+.gitignore
+CLAUDE.md
