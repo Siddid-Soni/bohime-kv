@@ -2,9 +2,10 @@
 
 A sharded, Raft-replicated key-value store in Rust, over gRPC.
 
-**Status: in progress (M1.5 of M13).** The Bitcask storage engine (record
+**Status: in progress (M1.6 of M13).** The Bitcask storage engine (record
 codec, append-only segments, crash-safe reopen via log replay, segment
-rotation, compaction with hint files) is implemented and tested; Raft,
+rotation, compaction with hint files, torn-tail truncation and a
+crash-safe compaction commit manifest) is implemented and tested; Raft,
 sharding, and the gRPC layer are still ahead. Design and milestone plan live
 in `docs/DESIGN.md` — architecture is multi-Raft (consistent hashing over
 256 shards, each an independent from-scratch Raft group), storage is a
