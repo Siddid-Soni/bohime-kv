@@ -9,8 +9,10 @@ use crate::types::{LogIndex, Term};
 /// rejection):
 ///
 /// - If the follower's conflicting term exists in our log, resume just after
-///   its last entry — skipping the whole term in one round trip instead of
-///   decrementing past it entry by entry.
+///   its last entry — but never past the follower's hinted index. The `min`
+///   matters: the follower's run of that term may be shorter than ours
+///   (divergent entries with coincidentally equal terms), and resuming past
+///   its end oscillates forever against its too-short hints.
 /// - Else if the follower named an index (log too short), resume there.
 /// - Else (no hint at all) fall back to one step back. This arm should be
 ///   unreachable against our own follower code, which always hints.
@@ -29,7 +31,11 @@ pub(crate) fn backtrack<S: RaftStorage>(
             }
         }
         if let Some(idx) = found {
-            return idx + 1;
+            let skip = idx + 1;
+            match conflict_index {
+                Some(hinted) => return skip.min(hinted).max(1),
+                None => return skip,
+            }
         }
     }
     if let Some(index) = conflict_index {

@@ -16,6 +16,7 @@ pub mod types;
 pub mod testing;
 
 #[cfg(test)]
+#[path = "tests/harness.rs"]
 pub(crate) mod harness;
 
 pub use message::{Action, Config, Message, ProposeError, ReadState, Ready, Role};

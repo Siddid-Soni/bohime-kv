@@ -10,7 +10,7 @@ use rand::{Rng, SeedableRng};
 
 use crate::election::{CandidateInfo, VoterState, should_grant_vote};
 use crate::log::{Consistency, check_consistency, last_log};
-use crate::message::{Action, Config, Message, Ready, Role};
+use crate::message::{Action, Config, Message, ProposeError, Ready, Role};
 use crate::replication::backtrack;
 use crate::storage::RaftStorage;
 use crate::types::{Entry, HardState, LogIndex, NodeId, Term};
@@ -84,27 +84,35 @@ impl<S: RaftStorage> RaftNode<S> {
 
     /// One logical-clock step. Followers/candidates count toward an election;
     /// leaders count toward a heartbeat.
+    ///
+    /// Returns this call's new actions and retains them: `ready()` drains the
+    /// same queue. A driver must consume one interface or the other, not both.
     pub fn tick(&mut self) -> Vec<Action> {
+        let checkpoint = self.outbox.len();
         if self.role == Role::Leader {
             self.heartbeat_elapsed += 1;
             if self.heartbeat_elapsed >= self.config.heartbeat_interval {
                 self.heartbeat_elapsed = 0;
                 self.broadcast_heartbeats();
             }
-            return self.drain_actions();
+            return self.new_actions_since(checkpoint);
         }
 
         self.election_elapsed += 1;
         if self.election_elapsed >= self.election_timeout {
             self.start_election();
         }
-        self.drain_actions()
+        self.new_actions_since(checkpoint)
     }
 
     /// Routes one inbound message through the term rules first, then dispatch.
     /// `from` is the sender's id — vote and replication accounting must know
     /// who answered, and anonymous votes would be double-countable.
+    ///
+    /// Like `tick`, returns this call's new actions while retaining them for
+    /// `ready()`: consume one interface or the other, not both.
     pub fn step(&mut self, from: NodeId, msg: Message) -> Vec<Action> {
+        let checkpoint = self.outbox.len();
         let term = msg.term();
         if term > self.current_term {
             self.observe_higher_term(term);
@@ -179,7 +187,23 @@ impl<S: RaftStorage> RaftNode<S> {
                 // Snapshots at M8.
             }
         }
-        self.drain_actions()
+        self.new_actions_since(checkpoint)
+    }
+
+    /// Appends a client command to the log. Only the leader accepts proposals;
+    /// anything else is `Err(NotLeader)` — clients find the leader via hints
+    /// (M6) or the sim's `leader()` (M4).
+    pub fn propose(&mut self, cmd: Vec<u8>) -> Result<LogIndex, ProposeError> {
+        if self.role != Role::Leader {
+            return Err(ProposeError::NotLeader);
+        }
+        let (last_index, _) = last_log(&self.storage);
+        let index = last_index + 1;
+        self.persist_entries(vec![Entry { term: self.current_term, index, command: cmd }]);
+        for peer in self.config.peers.clone() {
+            self.send_append(peer);
+        }
+        Ok(index)
     }
 
     /// Drains everything pending into a `Ready`. Execution order for the
@@ -253,8 +277,16 @@ impl<S: RaftStorage> RaftNode<S> {
             self.next_index.insert(peer, last_index + 1);
             self.match_index.insert(peer, 0);
         }
+        self.outstanding.clear();
         self.heartbeat_elapsed = 0;
-        // M3.5 appends the no-op entry here.
+        // A new leader appends a no-op in its own term. Everything before it
+        // becomes committable indirectly (figure-8 rule), and reads can
+        // proceed. Applied like any entry.
+        self.persist_entries(vec![Entry {
+            term: self.current_term,
+            index: last_index + 1,
+            command: Vec::new(),
+        }]);
         self.broadcast_heartbeats();
     }
 
@@ -402,12 +434,41 @@ impl<S: RaftStorage> RaftNode<S> {
                 }
                 self.next_index.insert(from, end + 1);
             }
-            // M3.5 advances the leader commit index here.
+            self.try_advance_commit();
         } else {
             let current_next = self.next_index.get(&from).copied().unwrap_or(1);
             let next = backtrack(current_next, conflict_term, conflict_index, &self.storage);
             self.next_index.insert(from, next.max(1));
             self.send_append(from);
+        }
+    }
+
+    /// Leader commit rule (§1.5): advance to the highest N such that a
+    /// majority holds N **and `log[N].term == current_term`**. The term check
+    /// is the figure-8 rule — committing a previous-term entry by count alone
+    /// lets a later leader overwrite it. Stale entries commit only indirectly,
+    /// under a current-term entry.
+    fn try_advance_commit(&mut self) {
+        let last = self.storage.last_index().expect("raft storage");
+        let mut target = self.commit_index;
+        for n in (self.commit_index + 1)..=last {
+            if self.storage.term(n).expect("raft storage") != Some(self.current_term) {
+                continue;
+            }
+            let mut count = 1; // the leader holds its whole log
+            for matched in self.match_index.values() {
+                if *matched >= n {
+                    count += 1;
+                }
+            }
+            if count >= self.config.quorum() {
+                target = n;
+            }
+        }
+        if target > self.commit_index {
+            self.commit_index = target;
+            self.persist_hard_state();
+            self.outbox.push(Action::ApplyEntries { up_to: target });
         }
     }
 
@@ -463,8 +524,9 @@ impl<S: RaftStorage> RaftNode<S> {
         self.outbox.push(Action::PersistEntries(entries));
     }
 
-    fn drain_actions(&mut self) -> Vec<Action> {
-        std::mem::take(&mut self.outbox)
+    /// This call's new actions, retained in the outbox for `ready()`.
+    fn new_actions_since(&mut self, checkpoint: usize) -> Vec<Action> {
+        self.outbox[checkpoint..].to_vec()
     }
 
     /// Test-only: snapshot the full log for convergence assertions (M3.4) and
@@ -513,3 +575,7 @@ mod request_vote_tests;
 #[cfg(test)]
 #[path = "tests/append_entries.rs"]
 mod append_entries_tests;
+
+#[cfg(test)]
+#[path = "tests/commit.rs"]
+mod commit_tests;

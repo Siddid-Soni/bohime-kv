@@ -16,7 +16,10 @@ pub struct Cluster {
 
 impl Cluster {
     pub fn of_three() -> Self {
-        let ids = [1, 2, 3];
+        Self::of_n(&[1, 2, 3])
+    }
+
+    pub fn of_n(ids: &[NodeId]) -> Self {
         let nodes = ids
             .iter()
             .map(|&id| {
