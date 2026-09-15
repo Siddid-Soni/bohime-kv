@@ -695,3 +695,32 @@ fn crash_before_compaction_commit_point_leaves_the_pre_compaction_state() {
     assert!(!dir.path().join("00000000000000000000.seg.tmp").exists(), "orphans cleared");
     assert!(!dir.path().join("00000000000000000000.hint.tmp").exists(), "orphans cleared");
 }
+
+#[test]
+fn malformed_hint_file_falls_back_to_full_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut engine = Engine::open_with_max_segment_size(dir.path(), 64).unwrap();
+        for i in 0..8u32 {
+            engine.put(format!("k{i}").as_bytes(), format!("v{i}").as_bytes()).unwrap();
+        }
+        engine.compact().unwrap();
+    }
+
+    let hint = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "hint"))
+        .expect("compaction writes a hint file");
+    std::fs::write(&hint, b"\x00\x01\x02").unwrap();
+
+    let mut engine = Engine::open_with_max_segment_size(dir.path(), 64).unwrap();
+    for i in 0..8u32 {
+        let key = format!("k{i}").into_bytes();
+        assert_eq!(
+            engine.get(&key).unwrap(),
+            Some(format!("v{i}").into_bytes()),
+            "a bad hint must degrade to a full replay, not a failed open"
+        );
+    }
+}

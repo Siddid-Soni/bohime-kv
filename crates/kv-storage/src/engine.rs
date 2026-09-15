@@ -57,8 +57,11 @@ fn write_hint_tmp(dir: &Path, id: SegmentId, entries: &[(Vec<u8>, ValueLoc)]) ->
     fs::write(dir.join(tmp_name(&hint_file_name(id))), buf)
 }
 
-/// Returns `None` if segment `id` has no hint file (nothing written for it
-/// yet, or it has never been compacted) — callers fall back to `replay`.
+/// Returns `None` if segment `id` has no hint file, or if the one it has does
+/// not parse — callers fall back to `replay`, which rebuilds the same keydir
+/// from the segment itself. A hint file is a cache of information the segment
+/// already contains, so a bad one is a performance problem, never a
+/// correctness one, and must not fail the open.
 fn read_hint_file(dir: &Path, id: SegmentId) -> io::Result<Option<HintEntries>> {
     let path = dir.join(hint_file_name(id));
     if !path.exists() {
@@ -66,25 +69,35 @@ fn read_hint_file(dir: &Path, id: SegmentId) -> io::Result<Option<HintEntries>> 
     }
 
     let data = fs::read(path)?;
+    match parse_hint_entries(&data, id) {
+        Some(entries) => Ok(Some(entries)),
+        None => {
+            tracing::warn!(segment = id, "hint file did not parse; falling back to full replay");
+            Ok(None)
+        }
+    }
+}
+
+fn parse_hint_entries(data: &[u8], id: SegmentId) -> Option<HintEntries> {
     let mut entries = Vec::new();
-    let mut rest = &data[..];
+    let mut rest = data;
     while !rest.is_empty() {
         if rest.len() < 16 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated hint entry header"));
+            return None;
         }
         let offset = u64::from_be_bytes(rest[0..8].try_into().unwrap());
         let len = u32::from_be_bytes(rest[8..12].try_into().unwrap());
         let key_len = u32::from_be_bytes(rest[12..16].try_into().unwrap()) as usize;
 
         if rest.len() < 16 + key_len {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated hint entry key"));
+            return None;
         }
         let key = rest[16..16 + key_len].to_vec();
 
         entries.push((key, ValueLoc { segment_id: id, offset, len }));
         rest = &rest[16 + key_len..];
     }
-    Ok(Some(entries))
+    Some(entries)
 }
 
 /// Names a compaction that has passed its commit point. Its presence in the
