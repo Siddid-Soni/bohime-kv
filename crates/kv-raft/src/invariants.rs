@@ -30,7 +30,10 @@ pub struct NodeView {
 }
 
 impl NodeView {
-    fn of<S: RaftStorage>(node: &RaftNode<S>) -> Self {
+    /// Snapshot one live node. Public because a caller holding nodes in a
+    /// map (kv-sim does) cannot produce the contiguous slice `check_all`
+    /// wants, and should not have to.
+    pub fn of<S: RaftStorage>(node: &RaftNode<S>) -> Self {
         Self {
             id: node.id(),
             term: node.current_term(),
@@ -41,8 +44,16 @@ impl NodeView {
     }
 
     /// The entry at `index`, or `None` if this node's log does not reach it.
+    ///
+    /// Binary search, not a scan: this runs inside the nested loops of every
+    /// check, on every step of every seed, so a linear scan here makes the
+    /// whole simulator quadratic in log length. Logs are sorted by index.
     fn at(&self, index: LogIndex) -> Option<&Entry> {
-        self.log.iter().find(|e| e.index == index)
+        self.log.binary_search_by_key(&index, |e| e.index).ok().map(|i| &self.log[i])
+    }
+
+    fn last_index(&self) -> LogIndex {
+        self.log.last().map(|e| e.index).unwrap_or(0)
     }
 }
 
@@ -109,17 +120,36 @@ fn election_safety(views: &[NodeView]) -> Result<(), Violation> {
 fn log_matching(views: &[NodeView]) -> Result<(), Violation> {
     for (i, a) in views.iter().enumerate() {
         for b in views.iter().skip(i + 1) {
-            for ea in &a.log {
-                let Some(eb) = b.at(ea.index) else { continue };
-                if ea.term != eb.term {
+            let shared = a.last_index().min(b.last_index());
+            // One ascending pass per pair: remember where the logs first
+            // differ, then the first index where they agree on a term *after*
+            // that point is the violation.
+            let mut diverged: Option<LogIndex> = None;
+            for index in 1..=shared {
+                let (Some(x), Some(y)) = (a.at(index), b.at(index)) else {
+                    if diverged.is_none() {
+                        diverged = Some(index);
+                    }
+                    continue;
+                };
+                if x.term != y.term {
+                    if diverged.is_none() {
+                        diverged = Some(index);
+                    }
                     continue;
                 }
-                if let Some(diverged_at) = first_divergence(a, b, ea.index) {
+                // Same index and same term: everything before must match.
+                let diverged_at = match diverged {
+                    Some(d) => Some(d),
+                    None if x != y => Some(index),
+                    None => None,
+                };
+                if let Some(diverged_at) = diverged_at {
                     return Err(Violation::LogMatching {
                         a: a.id,
                         b: b.id,
-                        index: ea.index,
-                        term: ea.term,
+                        index,
+                        term: x.term,
                         diverged_at,
                     });
                 }
@@ -127,15 +157,6 @@ fn log_matching(views: &[NodeView]) -> Result<(), Violation> {
         }
     }
     Ok(())
-}
-
-/// The lowest index at or below `through` where two logs disagree.
-fn first_divergence(a: &NodeView, b: &NodeView, through: LogIndex) -> Option<LogIndex> {
-    (1..=through).find(|&index| match (a.at(index), b.at(index)) {
-        (Some(x), Some(y)) => x != y,
-        (None, None) => false,
-        _ => true,
-    })
 }
 
 /// No two nodes commit different entries at the same index. This is the one

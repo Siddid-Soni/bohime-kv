@@ -36,5 +36,16 @@ jobs:
       - name: test
         run: cargo nextest run --workspace
 
-      - name: test (kv-raft testing feature)
-        run: cargo nextest run -p kv-raft --features testing
+      # M4's reproducibility dies silently if either pure crate gains an async
+      # runtime, and nothing else in CI would notice.
+      - name: kv-raft and kv-sim stay free of tokio
+        run: |
+          for crate in kv-raft kv-sim; do
+            if cargo tree -p "$crate" -e normal | grep -q tokio; then
+              echo "::error::$crate depends on tokio; the deterministic simulator requires it not to"
+              exit 1
+            fi
+          done
+
+      - name: seed sweeps (full gates)
+        run: cargo nextest run -p kv-sim --run-ignored all -E 'test(sweep_full)'

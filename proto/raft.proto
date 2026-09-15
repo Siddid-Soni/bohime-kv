@@ -45,6 +45,9 @@ message AppendEntriesResponse {
   // backtracking in one round trip instead of decrementing next_index by one.
   uint64 conflict_term = 3;
   uint64 conflict_index = 4;
+  // Highest index the follower confirms matching, so the leader never infers
+  // it from its own last send — see Message::AppendEntriesResp in kv-raft.
+  uint64 match_index = 5;
 }
 
 message InstallSnapshotChunk {

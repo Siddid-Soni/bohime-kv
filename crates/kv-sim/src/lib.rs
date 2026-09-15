@@ -3,5 +3,10 @@
 //! and node crash/restart. Drives `kv_raft`'s pure `Action`/`Ready`
 //! interface so a failure is reproducible byte-for-byte from its seed.
 
+pub mod clock;
+pub mod cluster;
+pub mod nemesis;
+pub mod network;
+
 #[cfg(test)]
 mod tests;

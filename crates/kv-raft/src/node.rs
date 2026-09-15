@@ -3,7 +3,7 @@
 //! caller must do — persist entries, persist hard state, send messages, apply
 //! committed entries — in that order (§1.5: disk before network).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -22,7 +22,9 @@ pub struct RaftNode<S: RaftStorage> {
     voted_for: Option<NodeId>,
     commit_index: LogIndex,
     last_applied: LogIndex,
-    votes_received: HashSet<NodeId>,
+    // BTreeSet, not HashSet: never iterated today, but M4's reproducibility
+    // dies silently the day someone iterates a hash container in here.
+    votes_received: BTreeSet<NodeId>,
     election_elapsed: u64,
     election_timeout: u64,
     heartbeat_elapsed: u64,
@@ -31,7 +33,6 @@ pub struct RaftNode<S: RaftStorage> {
     /// Last log index covered by the most recent `AppendEntries` sent to each
     /// peer. Lets a success response advance `match_index` without changing
     /// the response shape (the leader knows what it sent).
-    outstanding: BTreeMap<NodeId, LogIndex>,
     storage: S,
     rng: StdRng,
     outbox: Vec<Action>,
@@ -49,13 +50,12 @@ impl<S: RaftStorage> RaftNode<S> {
             voted_for: hs.voted_for,
             commit_index: hs.commit_index,
             last_applied: 0,
-            votes_received: HashSet::new(),
+            votes_received: BTreeSet::new(),
             election_elapsed: 0,
             election_timeout,
             heartbeat_elapsed: 0,
             next_index: BTreeMap::new(),
             match_index: BTreeMap::new(),
-            outstanding: BTreeMap::new(),
             storage,
             rng,
             outbox: Vec::new(),
@@ -149,6 +149,7 @@ impl<S: RaftStorage> RaftNode<S> {
                         Message::AppendEntriesResp {
                             term: self.current_term,
                             success: false,
+                            match_index: 0,
                             conflict_term: None,
                             conflict_index: None,
                         },
@@ -172,6 +173,7 @@ impl<S: RaftStorage> RaftNode<S> {
             Message::AppendEntriesResp {
                 term: resp_term,
                 success,
+                match_index,
                 conflict_term,
                 conflict_index,
             } => {
@@ -179,6 +181,7 @@ impl<S: RaftStorage> RaftNode<S> {
                     from,
                     resp_term,
                     success,
+                    match_index,
                     conflict_term,
                     conflict_index,
                 );
@@ -277,7 +280,6 @@ impl<S: RaftStorage> RaftNode<S> {
             self.next_index.insert(peer, last_index + 1);
             self.match_index.insert(peer, 0);
         }
-        self.outstanding.clear();
         self.heartbeat_elapsed = 0;
         // A new leader appends a no-op in its own term. Everything before it
         // becomes committable indirectly (figure-8 rule), and reads can
@@ -366,6 +368,7 @@ impl<S: RaftStorage> RaftNode<S> {
                     Message::AppendEntriesResp {
                         term: self.current_term,
                         success: false,
+                        match_index: 0,
                         conflict_term,
                         conflict_index,
                     },
@@ -385,19 +388,25 @@ impl<S: RaftStorage> RaftNode<S> {
             }
         }
         if first_new < entries.len() {
+            // §5.3: an existing entry *conflicts* — same index, different term
+            // — so delete it and everything after it, then append the rest.
             self.storage.truncate_suffix(base + first_new as LogIndex).expect("raft storage");
             self.persist_entries(entries[first_new..].to_vec());
-        } else {
-            // Everything sent is already here; drop any extra suffix beyond it.
-            let end = base + entries.len() as LogIndex;
-            if self.storage.last_index().expect("raft storage") >= end {
-                self.storage.truncate_suffix(end).expect("raft storage");
-            }
         }
+        // Deliberately no `else`. Entries past what this message covers are not
+        // in conflict with anything, and deleting them is not a tidy-up: they
+        // may already be committed, and dropping them shrinks the majority that
+        // holds a committed entry below a quorum. A later candidate that never
+        // had it can then win, and Leader Completeness is gone. Found by M4's
+        // seeded sweep, not by M3's own tests.
 
-        let last = self.storage.last_index().expect("raft storage");
-        if leader_commit > self.commit_index {
-            self.commit_index = leader_commit.min(last);
+        // Clamp to the range this AppendEntries actually confirmed, not to our
+        // whole log: a longer tail left over from an older leader carries no
+        // commitment from *this* one. Monotonic — commit_index never retreats.
+        let covered = prev_log_index + entries.len() as LogIndex;
+        let confirmed = leader_commit.min(covered);
+        if confirmed > self.commit_index {
+            self.commit_index = confirmed;
             self.persist_hard_state();
             self.outbox.push(Action::ApplyEntries { up_to: self.commit_index });
         }
@@ -406,6 +415,7 @@ impl<S: RaftStorage> RaftNode<S> {
             leader_id,
             Message::AppendEntriesResp {
                 term: self.current_term,
+                match_index: covered,
                 success: true,
                 conflict_term: None,
                 conflict_index: None,
@@ -420,6 +430,7 @@ impl<S: RaftStorage> RaftNode<S> {
         from: NodeId,
         resp_term: Term,
         success: bool,
+        reported_match: LogIndex,
         conflict_term: Option<Term>,
         conflict_index: Option<LogIndex>,
     ) {
@@ -427,12 +438,12 @@ impl<S: RaftStorage> RaftNode<S> {
             return;
         }
         if success {
-            if let Some(&end) = self.outstanding.get(&from) {
-                let matched = self.match_index.get(&from).copied().unwrap_or(0);
-                if end > matched {
-                    self.match_index.insert(from, end);
-                }
-                self.next_index.insert(from, end + 1);
+            // Monotonic: a delayed or duplicated reply to an older, shorter
+            // AppendEntries must never walk match_index backwards.
+            let matched = self.match_index.get(&from).copied().unwrap_or(0);
+            if reported_match > matched {
+                self.match_index.insert(from, reported_match);
+                self.next_index.insert(from, reported_match + 1);
             }
             self.try_advance_commit();
         } else {
@@ -486,8 +497,6 @@ impl<S: RaftStorage> RaftNode<S> {
         } else {
             Vec::new()
         };
-        let end = prev + entries.len() as LogIndex;
-        self.outstanding.insert(to, end);
         self.send(
             to,
             Message::AppendEntries {
@@ -527,6 +536,17 @@ impl<S: RaftStorage> RaftNode<S> {
     /// This call's new actions, retained in the outbox for `ready()`.
     fn new_actions_since(&mut self, checkpoint: usize) -> Vec<Action> {
         self.outbox[checkpoint..].to_vec()
+    }
+
+    /// Consumes the node, returning its storage.
+    ///
+    /// This is what makes a simulated crash honest: everything the node held
+    /// in memory — role, votes received, timers, next_index — is dropped, and
+    /// only what reached `RaftStorage` survives. Restarting is then
+    /// `RaftNode::new(config, storage)`, which restores term, vote and commit
+    /// index from `HardState` and nothing else.
+    pub fn into_storage(self) -> S {
+        self.storage
     }
 
     /// Every entry currently in the log. Inspection only — M4's invariant

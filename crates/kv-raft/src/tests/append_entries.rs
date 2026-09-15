@@ -45,12 +45,22 @@ fn divergent_follower_repair_converges() {
             }
         }
 
+        // A leader overwrites a follower's extra tail by *appending*, not by
+        // heartbeating: a non-conflicting suffix is left alone (§5.3), so it
+        // survives until an entry at that index conflicts with it. Real
+        // leaders always do this — M3.5's no-op on election is exactly this
+        // append — so proposing here is what a real repair looks like, and it
+        // exercises the conflict path that heartbeats alone never reach.
+        let ldr = cluster.nodes.iter_mut().find(|n| n.id() == leader).unwrap();
+        ldr.propose(b"repair".to_vec()).expect("leader accepts a proposal");
+        let expected = ldr.log_entries();
+
         for _ in 0..500 {
             cluster.tick_all();
         }
 
         for node in &cluster.nodes {
-            assert_eq!(node.log_entries(), leader_log, "figure-7 case {case} did not converge");
+            assert_eq!(node.log_entries(), expected, "figure-7 case {case} did not converge");
         }
     }
 }

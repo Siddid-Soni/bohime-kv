@@ -69,6 +69,14 @@ pub enum Message {
     AppendEntriesResp {
         term: Term,
         success: bool,
+        /// The highest index this follower has confirmed matches the leader's
+        /// log, as of this reply. The leader must take this rather than infer
+        /// it from its own last send: with several AppendEntries in flight to
+        /// one peer, a reply to an older, shorter one would otherwise be
+        /// credited with the newest, longest one's end index, and the leader
+        /// would commit entries the follower never received. Meaningless when
+        /// `success` is false.
+        match_index: LogIndex,
         conflict_term: Option<Term>,
         conflict_index: Option<LogIndex>,
     },

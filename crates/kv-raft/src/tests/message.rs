@@ -21,6 +21,7 @@ fn every_message_variant_round_trips_through_bincode() {
         Message::AppendEntriesResp {
             term: 3,
             success: false,
+            match_index: 0,
             conflict_term: Some(2),
             conflict_index: Some(4),
         },
