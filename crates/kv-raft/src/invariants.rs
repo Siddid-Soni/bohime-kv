@@ -189,9 +189,24 @@ fn state_machine_safety(views: &[NodeView]) -> Result<(), Violation> {
 }
 
 /// An entry committed in some term is present in every leader of a later term.
-/// Leaders at or below the committing term are exempt: a deposed leader that
-/// has not yet heard about the entry is not a violation.
+///
+/// A snapshot cannot see *which* term an entry was committed in, and the
+/// entry's own term is not a usable proxy: an entry created in term 1 can sit
+/// uncommitted for many terms and only be committed much later, under a much
+/// later leader — that is precisely the figure-8 shape. Treating `entry.term`
+/// as the committing term reports a deposed leader as a violation for an entry
+/// committed after it lost office, which is normal partitioned behaviour.
+///
+/// So this checks only leaders at the highest term present in the cluster,
+/// which is sound: every entry any node currently considers committed was
+/// committed by a leader of term <= T_max, so a leader at T_max either
+/// committed it itself or was elected after it was committed, and the election
+/// restriction guarantees it holds it. Leaders below T_max are stale and are
+/// exempt — a stale leader that has *committed* divergent data is caught by
+/// state machine safety instead, which has no such blind spot.
 fn leader_completeness(views: &[NodeView]) -> Result<(), Violation> {
+    let Some(max_term) = views.iter().map(|v| v.term).max() else { return Ok(()) };
+
     let mut committed: BTreeMap<LogIndex, Entry> = BTreeMap::new();
     for v in views {
         for e in v.log.iter().filter(|e| e.index <= v.commit_index) {
@@ -199,11 +214,8 @@ fn leader_completeness(views: &[NodeView]) -> Result<(), Violation> {
         }
     }
 
-    for l in views.iter().filter(|v| v.role == Role::Leader) {
+    for l in views.iter().filter(|v| v.role == Role::Leader && v.term == max_term) {
         for e in committed.values() {
-            if e.term >= l.term {
-                continue;
-            }
             if l.at(e.index) != Some(e) {
                 return Err(Violation::LeaderCompleteness {
                     leader: l.id,
