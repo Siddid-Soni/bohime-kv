@@ -4,10 +4,10 @@
 //! execute. See plan Part 2 for the `Action`/`Ready` interface and M3 for
 //! the build sequence (types, election, replication, commitment, safety).
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_wires_up() {
-        assert_eq!(2 + 2, 4);
-    }
-}
+pub mod storage;
+pub mod types;
+
+#[cfg(feature = "testing")]
+pub mod testing;
+
+pub use types::{Entry, HardState, LogIndex, NodeId, Snapshot, Term};
