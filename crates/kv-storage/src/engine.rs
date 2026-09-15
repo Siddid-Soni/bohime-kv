@@ -1,10 +1,16 @@
-//! Append-only Bitcask engine (M1.2-M1.5). `Engine` owns a directory of
+//! Append-only Bitcask engine (M1.2-M1.6). `Engine` owns a directory of
 //! numbered segment files; the keydir is rebuilt on open by replaying every
 //! segment (or, where a hint file exists, loading it directly) in ascending
 //! id order, and deletes persist as tombstones so they survive a reopen.
 //! `compact()` merges every closed segment's still-live data into one new
 //! segment plus a hint file, so a future reopen of that segment doesn't have
 //! to re-read every value to rebuild the keydir.
+//!
+//! Crash recovery (M1.6): a torn tail on the active segment is truncated away
+//! on open, and an interrupted compaction is either completed or discarded
+//! wholesale depending on whether it reached its manifest commit point. A
+//! torn *closed* segment is rejected rather than truncated — a crash cannot
+//! produce one, so it means real corruption.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};

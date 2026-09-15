@@ -724,3 +724,50 @@ fn malformed_hint_file_falls_back_to_full_replay() {
         );
     }
 }
+
+proptest::proptest! {
+    #[test]
+    fn recovery_after_truncation_matches_some_prefix_of_the_model(
+        ops in proptest::collection::vec(op_strategy(), 1..30),
+        cut_fraction in 0.0f64..1.0f64,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+
+        let mut model = std::collections::BTreeMap::<Vec<u8>, Vec<u8>>::new();
+        let mut snapshots = vec![model.clone()];
+        {
+            let mut engine = Engine::open(dir.path()).unwrap();
+            for op in &ops {
+                match op {
+                    Op::Put(k, v) => {
+                        engine.put(k, v).unwrap();
+                        model.insert(k.clone(), v.clone());
+                    }
+                    Op::Delete(k) => {
+                        engine.delete(k).unwrap();
+                        model.remove(k);
+                    }
+                }
+                snapshots.push(model.clone());
+            }
+        }
+
+        let path = segment_path(dir.path(), 0);
+        let len = file_len(&path);
+        truncate_to(&path, (len as f64 * cut_fraction) as u64);
+
+        let mut engine = Engine::open(dir.path()).unwrap();
+        let mut recovered = std::collections::BTreeMap::new();
+        for op in &ops {
+            let key = match op { Op::Put(k, _) | Op::Delete(k) => k };
+            if let Some(v) = engine.get(key).unwrap() {
+                recovered.insert(key.clone(), v);
+            }
+        }
+
+        proptest::prop_assert!(
+            snapshots.contains(&recovered),
+            "recovered state matches no prefix of the op sequence: {recovered:?}"
+        );
+    }
+}
