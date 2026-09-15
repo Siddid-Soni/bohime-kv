@@ -20,7 +20,7 @@ pub(crate) struct Record {
 }
 
 /// CRC32 over everything the header covers except the CRC field itself:
-/// timestamp | flags | key_len | value_len | key | value. 
+/// timestamp | flags | key_len | value_len | key | value.
 fn checksum(timestamp: u64, is_tombstone: bool, key: &[u8], value: &[u8]) -> u32 {
     let mut hasher = crc32fast::Hasher::new();
     hasher.update(&timestamp.to_be_bytes());
@@ -40,7 +40,7 @@ impl Record {
     }
 
     /// Builds a record with a correctly computed checksum. This is the
-    /// constructor real callers should use; 
+    /// constructor real callers should use;
     pub(crate) fn create(timestamp: u64, key: Vec<u8>, value: Vec<u8>) -> Self {
         let crc = checksum(timestamp, false, &key, &value);
         Self { crc, timestamp, is_tombstone: false, key, value }

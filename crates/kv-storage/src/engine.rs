@@ -88,12 +88,16 @@ fn read_hint_file(dir: &Path, id: SegmentId) -> io::Result<Option<HintEntries>> 
     Ok(Some(entries))
 }
 
-/// Rebuilds the keydir by decoding every record in one segment file, in
-/// order. A tombstone removes its key from the index instead of inserting
+/// Rebuilds the keydir by decoding records from one segment file, in order,
+/// and returns the byte length of the prefix that decoded cleanly.
+///
+/// Decoding stops at the first record that fails rather than erroring,
+/// because a torn tail is the expected state of the active segment after a
+/// crash. A tombstone removes its key from the index instead of inserting
 /// it; whichever record for a key is replayed last wins. Callers must
 /// replay segments in ascending `SegmentId` order for that to be correct
 /// across the whole log, not just within one file.
-fn replay(mut file: &File, segment_id: SegmentId, index: &mut HashMapIndex) -> io::Result<()> {
+fn replay(mut file: &File, segment_id: SegmentId, index: &mut HashMapIndex) -> io::Result<u64> {
     file.seek(SeekFrom::Start(0))?;
     let mut buf = Vec::new();
     file.read_to_end(&mut buf)?;
@@ -101,20 +105,24 @@ fn replay(mut file: &File, segment_id: SegmentId, index: &mut HashMapIndex) -> i
     let mut offset = 0u64;
     let mut rest = &buf[..];
     while !rest.is_empty() {
-        let (record, consumed) =
-            Record::decode(rest).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if let Ok((record, consumed)) = Record::decode(rest) {
+            if record.is_tombstone {
+                index.remove(&record.key);
+            } else {
+                index.insert(
+                    record.key.clone(),
+                    ValueLoc { segment_id, offset, len: consumed as u32 },
+                );
+            }
 
-        if record.is_tombstone {
-            index.remove(&record.key);
+            offset += consumed as u64;
+            rest = &rest[consumed..];
         } else {
-            index.insert(record.key.clone(), ValueLoc { segment_id, offset, len: consumed as u32 });
+            break;
         }
-
-        offset += consumed as u64;
-        rest = &rest[consumed..];
     }
 
-    Ok(())
+    Ok(offset)
 }
 
 pub struct Engine {
@@ -152,19 +160,47 @@ impl Engine {
             segments.insert(id, open_segment(&dir, id)?);
         }
 
+        let active_id = *ids.last().expect("ids always has at least one entry");
+
         let mut index = HashMapIndex::default();
         for &id in &ids {
-            match read_hint_file(&dir, id)? {
-                Some(hints) => {
-                    for (key, loc) in hints {
-                        index.insert(key, loc);
-                    }
+            if id != active_id
+                && let Some(hints) = read_hint_file(&dir, id)?
+            {
+                for (key, loc) in hints {
+                    index.insert(key, loc);
                 }
-                None => replay(&segments[&id], id, &mut index)?,
+                continue;
             }
+
+            let valid_len = replay(&segments[&id], id, &mut index)?;
+            let on_disk_len = segments[&id].metadata()?.len();
+            if valid_len == on_disk_len {
+                continue;
+            }
+
+            if id != active_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "segment {id} is corrupt at offset {valid_len} ({} trailing bytes do not decode)",
+                        on_disk_len - valid_len
+                    ),
+                ));
+            }
+
+            tracing::warn!(
+                segment = id,
+                valid_len,
+                discarded = on_disk_len - valid_len,
+                "discarding torn tail of active segment after unclean shutdown"
+            );
+            segments
+                .get_mut(&id)
+                .expect("segment just replayed must be open")
+                .set_len(valid_len)?;
         }
 
-        let active_id = *ids.last().expect("ids always has at least one entry");
         let active_offset = segments[&active_id].metadata()?.len();
 
         Ok(Self { dir, max_segment_size, active_id, active_offset, segments, index })
