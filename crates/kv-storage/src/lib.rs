@@ -4,8 +4,10 @@
 //! (M1.2), keydir rebuild behind a `KeyDirIndex` trait (M1.3), segment
 //! rotation (M1.4), compaction + hint files (M1.5), crash recovery (M1.6),
 //! and configurable fsync policy (M1.7).
+mod config;
 mod engine;
 mod index;
 mod record;
 
+pub use config::{EngineConfig, FsyncPolicy};
 pub use engine::Engine;

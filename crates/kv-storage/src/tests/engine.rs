@@ -1,4 +1,5 @@
 use super::*;
+use crate::{EngineConfig, FsyncPolicy};
 
 #[test]
 fn put_then_get_returns_value() {
@@ -769,5 +770,90 @@ proptest::proptest! {
             snapshots.contains(&recovered),
             "recovered state matches no prefix of the op sequence: {recovered:?}"
         );
+    }
+}
+
+// --- M1.7 Task 2: fsync policy on the write path ---
+
+#[test]
+fn every_write_policy_syncs_once_per_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = EngineConfig { fsync_policy: FsyncPolicy::EveryWrite, ..Default::default() };
+    let mut engine = Engine::open_with_config(dir.path(), config).unwrap();
+
+    engine.put(b"a", b"1").unwrap();
+    engine.put(b"b", b"2").unwrap();
+    engine.delete(b"a").unwrap();
+
+    assert_eq!(engine.sync_count(), 3, "a tombstone is a write and must be synced too");
+}
+
+#[test]
+fn never_policy_issues_no_syncs() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = EngineConfig { fsync_policy: FsyncPolicy::Never, ..Default::default() };
+    let mut engine = Engine::open_with_config(dir.path(), config).unwrap();
+
+    for i in 0..100u32 {
+        engine.put(format!("k{i}").as_bytes(), b"v").unwrap();
+    }
+
+    assert_eq!(engine.sync_count(), 0);
+}
+
+#[test]
+fn explicit_sync_works_under_every_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = EngineConfig { fsync_policy: FsyncPolicy::Never, ..Default::default() };
+    let mut engine = Engine::open_with_config(dir.path(), config).unwrap();
+
+    engine.put(b"a", b"1").unwrap();
+    engine.sync().unwrap();
+
+    assert_eq!(engine.sync_count(), 1, "sync() must bypass the policy");
+
+    engine.sync().unwrap();
+    assert_eq!(engine.sync_count(), 1, "a second sync with nothing pending is a no-op");
+}
+
+#[test]
+fn group_commit_syncs_once_per_batch_not_once_per_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = EngineConfig {
+        fsync_policy: FsyncPolicy::GroupCommit {
+            max_records: 10,
+            max_delay: std::time::Duration::from_secs(3600),
+        },
+        ..Default::default()
+    };
+    let mut engine = Engine::open_with_config(dir.path(), config).unwrap();
+
+    for i in 0..25u32 {
+        engine.put(format!("k{i}").as_bytes(), b"v").unwrap();
+    }
+
+    assert_eq!(engine.sync_count(), 2, "25 writes at a batch of 10 is two full batches");
+}
+
+#[test]
+fn data_is_still_correct_under_every_policy() {
+    for policy in [
+        FsyncPolicy::Never,
+        FsyncPolicy::EveryWrite,
+        FsyncPolicy::GroupCommit { max_records: 4, max_delay: std::time::Duration::from_millis(5) },
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let config = EngineConfig { fsync_policy: policy, ..Default::default() };
+        {
+            let mut engine = Engine::open_with_config(dir.path(), config).unwrap();
+            for i in 0..50u32 {
+                engine.put(format!("k{i}").as_bytes(), format!("v{i}").as_bytes()).unwrap();
+            }
+            engine.delete(b"k7").unwrap();
+        }
+
+        let mut engine = Engine::open_with_config(dir.path(), config).unwrap();
+        assert_eq!(engine.get(b"k7").unwrap(), None, "policy: {policy:?}");
+        assert_eq!(engine.get(b"k8").unwrap(), Some(b"v8".to_vec()), "policy: {policy:?}");
     }
 }

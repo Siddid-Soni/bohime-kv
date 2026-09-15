@@ -18,12 +18,9 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::config::EngineConfig;
 use crate::index::{HashMapIndex, KeyDirIndex, SegmentId, ValueLoc};
 use crate::record::Record;
-
-/// Arbitrary default; production tuning is out of scope for this milestone.
-/// Tests that need to force rotation use `open_with_max_segment_size`.
-const DEFAULT_MAX_SEGMENT_SIZE: u64 = 64 * 1024 * 1024;
 
 fn now_millis() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
@@ -229,22 +226,31 @@ fn replay(mut file: &File, segment_id: SegmentId, index: &mut HashMapIndex) -> i
 
 pub struct Engine {
     dir: PathBuf,
-    max_segment_size: u64,
+    config: EngineConfig,
     active_id: SegmentId,
     active_offset: u64,
     segments: BTreeMap<SegmentId, File>,
     index: HashMapIndex,
+    unsynced: usize,
+    last_sync: std::time::Instant,
+    syncs: u64,
 }
 
 impl Engine {
     pub fn open(dir: impl AsRef<Path>) -> io::Result<Self> {
-        Self::open_with_max_segment_size(dir, DEFAULT_MAX_SEGMENT_SIZE)
+        Self::open_with_config(dir, EngineConfig::default())
     }
 
+    /// Retained so M1.4-M1.6 tests keep working unchanged; equivalent to
+    /// `open_with_config` with the default fsync policy.
     pub fn open_with_max_segment_size(
         dir: impl AsRef<Path>,
         max_segment_size: u64,
     ) -> io::Result<Self> {
+        Self::open_with_config(dir, EngineConfig { max_segment_size, ..Default::default() })
+    }
+
+    pub fn open_with_config(dir: impl AsRef<Path>, config: EngineConfig) -> io::Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
 
@@ -310,7 +316,17 @@ impl Engine {
 
         let active_offset = segments[&active_id].metadata()?.len();
 
-        Ok(Self { dir, max_segment_size, active_id, active_offset, segments, index })
+        Ok(Self {
+            dir,
+            config,
+            active_id,
+            active_offset,
+            segments,
+            index,
+            unsynced: 0,
+            last_sync: std::time::Instant::now(),
+            syncs: 0,
+        })
     }
 
     /// Writes `encoded` to the active segment, rotating to a fresh one first
@@ -320,7 +336,8 @@ impl Engine {
     fn append(&mut self, encoded: &[u8]) -> io::Result<ValueLoc> {
         let len = encoded.len() as u32;
 
-        if self.active_offset > 0 && self.active_offset + len as u64 > self.max_segment_size {
+        if self.active_offset > 0 && self.active_offset + len as u64 > self.config.max_segment_size
+        {
             self.rotate()?;
         }
 
@@ -329,10 +346,41 @@ impl Engine {
 
         let loc = ValueLoc { segment_id: self.active_id, offset: self.active_offset, len };
         self.active_offset += len as u64;
+        self.unsynced += 1;
         Ok(loc)
     }
 
+    /// Flushes the active segment to stable storage regardless of policy, and
+    /// resets the group-commit window. A no-op when nothing is pending, so
+    /// calling it defensively costs nothing.
+    pub fn sync(&mut self) -> io::Result<()> {
+        if self.unsynced == 0 {
+            return Ok(());
+        }
+        let file = self.segments.get(&self.active_id).expect("active segment always present");
+        file.sync_data()?;
+        self.unsynced = 0;
+        self.last_sync = std::time::Instant::now();
+        self.syncs += 1;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sync_count(&self) -> u64 {
+        self.syncs
+    }
+
+    /// Flushes if the configured policy says this write should be the one
+    /// that triggers it. Called after every append.
+    fn maybe_sync(&mut self) -> io::Result<()> {
+        if self.config.fsync_policy.should_sync(self.unsynced, self.last_sync.elapsed()) {
+            self.sync()?;
+        }
+        Ok(())
+    }
+
     fn rotate(&mut self) -> io::Result<()> {
+        self.sync()?;
         self.active_id += 1;
         let file = open_segment(&self.dir, self.active_id)?;
         self.segments.insert(self.active_id, file);
@@ -344,6 +392,7 @@ impl Engine {
         let record = Record::create(now_millis(), key.to_vec(), value.to_vec());
         let loc = self.append(&record.encode())?;
         self.index.insert(key.to_vec(), loc);
+        self.maybe_sync()?;
         Ok(())
     }
 
@@ -371,6 +420,7 @@ impl Engine {
         let record = Record::tombstone(now_millis(), key.to_vec());
         self.append(&record.encode())?;
         self.index.remove(key);
+        self.maybe_sync()?;
         Ok(())
     }
 
