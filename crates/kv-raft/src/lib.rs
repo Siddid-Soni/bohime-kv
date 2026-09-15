@@ -6,6 +6,7 @@
 
 pub mod conformance;
 pub mod election;
+pub mod invariants;
 pub mod log;
 pub mod message;
 pub mod node;

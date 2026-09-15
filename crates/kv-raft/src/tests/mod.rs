@@ -11,6 +11,7 @@ mod append_entries;
 mod commit;
 mod conformance;
 mod election_restriction;
+mod invariants;
 mod message;
 mod node_tick;
 mod request_vote;
