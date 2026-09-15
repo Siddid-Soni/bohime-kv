@@ -43,11 +43,10 @@ fn hint_file_name(id: SegmentId) -> String {
 /// record in the segment it describes.
 type HintEntries = Vec<(Vec<u8>, ValueLoc)>;
 
-/// Hint entries describe exactly what a compacted segment holds on disk —
-/// `offset(8) | len(4) | key_len(4) | key` back to back, no crc/timestamp/
-/// value — so a reopen can rebuild the keydir for that segment without
-/// reading a single value.
-fn write_hint_file(dir: &Path, id: SegmentId, entries: &[(Vec<u8>, ValueLoc)]) -> io::Result<()> {
+/// Writes a segment's hint entries to `{id}.hint.tmp`. The rename into place
+/// is `finish_compaction`'s job, so a hint file never exists describing a
+/// segment that was not also renamed into place.
+fn write_hint_tmp(dir: &Path, id: SegmentId, entries: &[(Vec<u8>, ValueLoc)]) -> io::Result<()> {
     let mut buf = Vec::new();
     for (key, loc) in entries {
         buf.extend_from_slice(&loc.offset.to_be_bytes());
@@ -55,7 +54,7 @@ fn write_hint_file(dir: &Path, id: SegmentId, entries: &[(Vec<u8>, ValueLoc)]) -
         buf.extend_from_slice(&(key.len() as u32).to_be_bytes());
         buf.extend_from_slice(key);
     }
-    fs::write(dir.join(hint_file_name(id)), buf)
+    fs::write(dir.join(tmp_name(&hint_file_name(id))), buf)
 }
 
 /// Returns `None` if segment `id` has no hint file (nothing written for it
@@ -86,6 +85,90 @@ fn read_hint_file(dir: &Path, id: SegmentId) -> io::Result<Option<HintEntries>> 
         rest = &rest[16 + key_len..];
     }
     Ok(Some(entries))
+}
+
+/// Names a compaction that has passed its commit point. Its presence in the
+/// directory means the merged segment is fully written under a `.tmp` name
+/// and the retired segments may be unlinked; `open` replays the remaining
+/// steps before touching anything else, which is what makes an interrupted
+/// compaction safe rather than corrupting.
+const MANIFEST_NAME: &str = "compaction.manifest";
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct CompactionManifest {
+    /// `None` when every retired segment was entirely dead, so there is no
+    /// merged output at all — only deletions to finish.
+    new_id: Option<SegmentId>,
+    old_ids: Vec<SegmentId>,
+}
+
+fn tmp_name(name: &str) -> String {
+    format!("{name}.tmp")
+}
+
+/// Writes the manifest to a temporary file and renames it into place, so it
+/// appears atomically. This rename is the compaction's commit point.
+pub(crate) fn write_manifest(dir: &Path, manifest: &CompactionManifest) -> io::Result<()> {
+    let encoded =
+        bincode::serialize(manifest).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let tmp = dir.join(tmp_name(MANIFEST_NAME));
+    fs::write(&tmp, encoded)?;
+    fs::rename(tmp, dir.join(MANIFEST_NAME))
+}
+
+fn read_manifest(dir: &Path) -> io::Result<Option<CompactionManifest>> {
+    let path = dir.join(MANIFEST_NAME);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let data = fs::read(&path)?;
+    match bincode::deserialize(&data) {
+        Ok(manifest) => Ok(Some(manifest)),
+        Err(e) => {
+            tracing::warn!(error = %e, "ignoring unreadable compaction manifest");
+            let _ = fs::remove_file(&path);
+            Ok(None)
+        }
+    }
+}
+
+/// Completes a committed compaction. Idempotent: every step is skipped if it
+/// has already happened, so it is safe to run on every open and safe to be
+/// interrupted and run again.
+fn finish_compaction(dir: &Path, manifest: &CompactionManifest) -> io::Result<()> {
+    if let Some(new_id) = manifest.new_id {
+        let seg = segment_file_name(new_id);
+        let seg_tmp = dir.join(tmp_name(&seg));
+        if seg_tmp.exists() {
+            fs::rename(seg_tmp, dir.join(&seg))?;
+        }
+        let hint = hint_file_name(new_id);
+        let hint_tmp = dir.join(tmp_name(&hint));
+        if hint_tmp.exists() {
+            fs::rename(hint_tmp, dir.join(&hint))?;
+        }
+    }
+
+    for &id in &manifest.old_ids {
+        if Some(id) != manifest.new_id {
+            let _ = fs::remove_file(dir.join(segment_file_name(id)));
+            let _ = fs::remove_file(dir.join(hint_file_name(id)));
+        }
+    }
+
+    fs::remove_file(dir.join(MANIFEST_NAME))
+}
+
+/// Removes `.tmp` files left by a compaction that never reached its commit
+/// point. Called only when no manifest exists, so these are always orphans.
+fn clear_orphan_tmp_files(dir: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().ends_with(".tmp") {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+    Ok(())
 }
 
 /// Rebuilds the keydir by decoding records from one segment file, in order,
@@ -145,6 +228,11 @@ impl Engine {
     ) -> io::Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
+
+        match read_manifest(&dir)? {
+            Some(manifest) => finish_compaction(&dir, &manifest)?,
+            None => clear_orphan_tmp_files(&dir)?,
+        }
 
         let mut ids: Vec<SegmentId> = fs::read_dir(&dir)?
             .filter_map(|entry| entry.ok())
@@ -308,58 +396,61 @@ impl Engine {
         Ok(Some(CompactionPlan { old_segment_ids, new_segment_id, entries }))
     }
 
-    /// Writes the plan's live entries into one new segment (reusing the
-    /// smallest retired segment id so it still sorts before the active
-    /// segment) plus its hint file, relocates the index — skipping any key
-    /// overwritten since the plan was taken — then deletes the other old
-    /// segment files.
+    /// Writes the plan's live entries into a temporary segment (named for the
+    /// smallest retired id, so the merged data still sorts before the active
+    /// segment on the next replay) plus its hint file, relocates the index —
+    /// skipping any key overwritten since the plan was taken — then commits
+    /// with a manifest and finishes the renames and unlinks.
+    ///
+    /// Nothing before `write_manifest` is visible to a reopen; everything
+    /// after it is replayable by `finish_compaction`. That is what keeps a
+    /// crash mid-compaction from either losing the merge or letting a stale
+    /// retired segment replay over it.
     fn apply_compaction(&mut self, plan: CompactionPlan) -> io::Result<()> {
         let CompactionPlan { old_segment_ids, new_segment_id, entries } = plan;
 
-        if entries.is_empty() {
-            for id in &old_segment_ids {
-                self.segments.remove(id);
-                let _ = fs::remove_file(self.dir.join(segment_file_name(*id)));
-                let _ = fs::remove_file(self.dir.join(hint_file_name(*id)));
+        let manifest = if entries.is_empty() {
+            CompactionManifest { new_id: None, old_ids: old_segment_ids.clone() }
+        } else {
+            let mut hint_entries = Vec::with_capacity(entries.len());
+            let mut relocations = Vec::with_capacity(entries.len());
+
+            let seg_tmp = self.dir.join(tmp_name(&segment_file_name(new_segment_id)));
+            {
+                let mut file = File::create(&seg_tmp)?;
+                let mut offset = 0u64;
+                for (key, old_loc, value) in &entries {
+                    let record = Record::create(now_millis(), key.clone(), value.clone());
+                    let encoded = record.encode();
+                    file.write_all(&encoded)?;
+
+                    let new_loc =
+                        ValueLoc { segment_id: new_segment_id, offset, len: encoded.len() as u32 };
+                    hint_entries.push((key.clone(), new_loc));
+                    relocations.push((key.clone(), *old_loc, new_loc));
+                    offset += encoded.len() as u64;
+                }
+                file.sync_all()?;
             }
-            return Ok(());
+
+            write_hint_tmp(&self.dir, new_segment_id, &hint_entries)?;
+
+            for (key, old_loc, new_loc) in relocations {
+                self.index.relocate(&key, old_loc, new_loc);
+            }
+
+            CompactionManifest { new_id: Some(new_segment_id), old_ids: old_segment_ids.clone() }
+        };
+
+        for id in &old_segment_ids {
+            self.segments.remove(id);
         }
 
-        let mut hint_entries = Vec::with_capacity(entries.len());
-        let mut relocations = Vec::with_capacity(entries.len());
-        {
-            let file = self
-                .segments
-                .get_mut(&new_segment_id)
-                .expect("new_segment_id must be an open segment");
-            file.set_len(0)?;
-            file.seek(SeekFrom::Start(0))?;
+        write_manifest(&self.dir, &manifest)?;
+        finish_compaction(&self.dir, &manifest)?;
 
-            let mut offset = 0u64;
-            for (key, old_loc, value) in &entries {
-                let record = Record::create(now_millis(), key.clone(), value.clone());
-                let encoded = record.encode();
-                file.write_all(&encoded)?;
-
-                let new_loc =
-                    ValueLoc { segment_id: new_segment_id, offset, len: encoded.len() as u32 };
-                hint_entries.push((key.clone(), new_loc));
-                relocations.push((key.clone(), *old_loc, new_loc));
-                offset += encoded.len() as u64;
-            }
-        }
-
-        for (key, old_loc, new_loc) in relocations {
-            self.index.relocate(&key, old_loc, new_loc);
-        }
-        write_hint_file(&self.dir, new_segment_id, &hint_entries)?;
-
-        for id in old_segment_ids {
-            if id != new_segment_id {
-                self.segments.remove(&id);
-                let _ = fs::remove_file(self.dir.join(segment_file_name(id)));
-                let _ = fs::remove_file(self.dir.join(hint_file_name(id)));
-            }
+        if let Some(new_id) = manifest.new_id {
+            self.segments.insert(new_id, open_segment(&self.dir, new_id)?);
         }
 
         Ok(())

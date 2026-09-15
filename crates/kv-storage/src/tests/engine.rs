@@ -109,7 +109,11 @@ fn write_10k_keys_drop_reopen_all_readable() {
 }
 
 fn segment_file_count(dir: &std::path::Path) -> usize {
-    std::fs::read_dir(dir).unwrap().count()
+    std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".seg"))
+        .count()
 }
 
 #[test]
@@ -216,7 +220,12 @@ fn hint_file_round_trips() {
         (b"bb".to_vec(), ValueLoc { segment_id: 3, offset: 10, len: 20 }),
     ];
 
-    write_hint_file(dir.path(), 3, &entries).unwrap();
+    write_hint_tmp(dir.path(), 3, &entries).unwrap();
+    std::fs::rename(
+        dir.path().join(tmp_name(&hint_file_name(3))),
+        dir.path().join(hint_file_name(3)),
+    )
+    .unwrap();
     let read_back = read_hint_file(dir.path(), 3).unwrap().unwrap();
 
     assert_eq!(read_back, entries);
@@ -588,4 +597,101 @@ proptest::proptest! {
             proptest::prop_assert_eq!(actual, expected, "mismatch for key {:?}", key);
         }
     }
+}
+
+// --- M1.6 Task 2: compaction commit manifest ---
+
+#[test]
+fn crash_after_compaction_commit_point_completes_on_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut engine = Engine::open_with_max_segment_size(dir.path(), 64).unwrap();
+        for _ in 0..3 {
+            for i in 0..5u32 {
+                engine.put(format!("k{i}").as_bytes(), format!("v{i}").as_bytes()).unwrap();
+            }
+        }
+        engine.put(b"k0", b"final").unwrap();
+    }
+
+    let manifest = {
+        let mut engine = Engine::open_with_max_segment_size(dir.path(), 64).unwrap();
+        let plan = engine.plan_compaction().unwrap().expect("something to compact");
+        let manifest = CompactionManifest {
+            new_id: Some(plan.new_segment_id),
+            old_ids: plan.old_segment_ids.clone(),
+        };
+        engine.apply_compaction(plan).unwrap();
+        manifest
+    };
+    write_manifest(dir.path(), &manifest).unwrap();
+
+    let mut engine = Engine::open_with_max_segment_size(dir.path(), 64).unwrap();
+    assert_eq!(engine.get(b"k0").unwrap(), Some(b"final".to_vec()));
+    for i in 1..5u32 {
+        let key = format!("k{i}").into_bytes();
+        assert_eq!(engine.get(&key).unwrap(), Some(format!("v{i}").into_bytes()));
+    }
+    assert!(!dir.path().join(MANIFEST_NAME).exists(), "manifest must be cleared once replayed");
+}
+
+#[test]
+fn stale_retired_segment_left_by_a_crash_cannot_win_over_the_merge() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut engine = Engine::open_with_max_segment_size(dir.path(), 64).unwrap();
+        for i in 0..8u32 {
+            engine.put(b"k", format!("v{i}").as_bytes()).unwrap();
+        }
+        engine.put(b"k", b"newest").unwrap();
+    }
+
+    let before: Vec<(std::path::PathBuf, Vec<u8>)> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .map(|p| (p.clone(), std::fs::read(&p).unwrap()))
+        .collect();
+
+    let manifest = {
+        let mut engine = Engine::open_with_max_segment_size(dir.path(), 64).unwrap();
+        let plan = engine.plan_compaction().unwrap().expect("something to compact");
+        let manifest = CompactionManifest {
+            new_id: Some(plan.new_segment_id),
+            old_ids: plan.old_segment_ids.clone(),
+        };
+        engine.apply_compaction(plan).unwrap();
+        manifest
+    };
+    for (path, bytes) in before {
+        if !path.exists() {
+            std::fs::write(&path, &bytes).unwrap();
+        }
+    }
+    write_manifest(dir.path(), &manifest).unwrap();
+
+    let mut engine = Engine::open_with_max_segment_size(dir.path(), 64).unwrap();
+    assert_eq!(
+        engine.get(b"k").unwrap(),
+        Some(b"newest".to_vec()),
+        "restored stale segments must not replay over the merged segment"
+    );
+}
+
+#[test]
+fn crash_before_compaction_commit_point_leaves_the_pre_compaction_state() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut engine = Engine::open_with_max_segment_size(dir.path(), 64).unwrap();
+        for i in 0..8u32 {
+            engine.put(b"k", format!("v{i}").as_bytes()).unwrap();
+        }
+    }
+
+    std::fs::write(dir.path().join("00000000000000000000.seg.tmp"), b"garbage").unwrap();
+    std::fs::write(dir.path().join("00000000000000000000.hint.tmp"), b"garbage").unwrap();
+
+    let mut engine = Engine::open_with_max_segment_size(dir.path(), 64).unwrap();
+    assert_eq!(engine.get(b"k").unwrap(), Some(b"v7".to_vec()));
+    assert!(!dir.path().join("00000000000000000000.seg.tmp").exists(), "orphans cleared");
+    assert!(!dir.path().join("00000000000000000000.hint.tmp").exists(), "orphans cleared");
 }
