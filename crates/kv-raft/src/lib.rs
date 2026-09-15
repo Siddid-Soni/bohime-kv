@@ -8,6 +8,7 @@ pub mod election;
 pub mod log;
 pub mod message;
 pub mod node;
+pub mod replication;
 pub mod storage;
 pub mod types;
 

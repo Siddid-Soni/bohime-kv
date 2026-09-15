@@ -9,8 +9,9 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 use crate::election::{CandidateInfo, VoterState, should_grant_vote};
-use crate::log::last_log;
+use crate::log::{Consistency, check_consistency, last_log};
 use crate::message::{Action, Config, Message, Ready, Role};
+use crate::replication::backtrack;
 use crate::storage::RaftStorage;
 use crate::types::{Entry, HardState, LogIndex, NodeId, Term};
 
@@ -27,6 +28,10 @@ pub struct RaftNode<S: RaftStorage> {
     heartbeat_elapsed: u64,
     next_index: BTreeMap<NodeId, LogIndex>,
     match_index: BTreeMap<NodeId, LogIndex>,
+    /// Last log index covered by the most recent `AppendEntries` sent to each
+    /// peer. Lets a success response advance `match_index` without changing
+    /// the response shape (the leader knows what it sent).
+    outstanding: BTreeMap<NodeId, LogIndex>,
     storage: S,
     rng: StdRng,
     outbox: Vec<Action>,
@@ -50,6 +55,7 @@ impl<S: RaftStorage> RaftNode<S> {
             heartbeat_elapsed: 0,
             next_index: BTreeMap::new(),
             match_index: BTreeMap::new(),
+            outstanding: BTreeMap::new(),
             storage,
             rng,
             outbox: Vec::new(),
@@ -124,10 +130,10 @@ impl<S: RaftStorage> RaftNode<S> {
             Message::AppendEntries {
                 term: msg_term,
                 leader_id,
-                prev_log_index: _,
-                prev_log_term: _,
-                entries: _,
-                leader_commit: _,
+                prev_log_index,
+                prev_log_term,
+                entries,
+                leader_commit,
             } => {
                 if msg_term < self.current_term {
                     self.send(
@@ -141,17 +147,33 @@ impl<S: RaftStorage> RaftNode<S> {
                     );
                 } else {
                     // A legitimate leader exists: suppress our election and
-                    // follow it. Log consistency lands at M3.4.
+                    // follow it before touching the log.
                     if self.role != Role::Follower {
                         self.role = Role::Follower;
                     }
                     self.reset_election_timer();
-                    // M3.4: consistency check + append + commit update + success reply.
-                    let _ = leader_id;
+                    self.handle_append_entries(
+                        leader_id,
+                        prev_log_index,
+                        prev_log_term,
+                        entries,
+                        leader_commit,
+                    );
                 }
             }
-            Message::AppendEntriesResp { .. } => {
-                // Replication bookkeeping at M3.4.
+            Message::AppendEntriesResp {
+                term: resp_term,
+                success,
+                conflict_term,
+                conflict_index,
+            } => {
+                self.handle_append_entries_resp(
+                    from,
+                    resp_term,
+                    success,
+                    conflict_term,
+                    conflict_index,
+                );
             }
             Message::InstallSnapshot { .. } | Message::InstallSnapshotResp { .. } => {
                 // Snapshots at M8.
@@ -237,19 +259,8 @@ impl<S: RaftStorage> RaftNode<S> {
     }
 
     fn broadcast_heartbeats(&mut self) {
-        let (last_index, last_term) = last_log(&self.storage);
         for peer in self.config.peers.clone() {
-            self.send(
-                peer,
-                Message::AppendEntries {
-                    term: self.current_term,
-                    leader_id: self.config.id,
-                    prev_log_index: last_index,
-                    prev_log_term: last_term,
-                    entries: vec![],
-                    leader_commit: self.commit_index,
-                },
-            );
+            self.send_append(peer);
         }
     }
 
@@ -304,6 +315,131 @@ impl<S: RaftStorage> RaftNode<S> {
         }
     }
 
+    /// Follower-side log replication: consistency check, conflict truncation,
+    /// append, commit update, reply. The Log Matching Property falls out of
+    /// truncating at the first divergence: after this handler, our log is
+    /// identical to the leader's through the last sent entry.
+    fn handle_append_entries(
+        &mut self,
+        leader_id: NodeId,
+        prev_log_index: LogIndex,
+        prev_log_term: Term,
+        entries: Vec<Entry>,
+        leader_commit: LogIndex,
+    ) {
+        match check_consistency(&self.storage, prev_log_index, prev_log_term) {
+            Consistency::Mismatch { conflict_term, conflict_index } => {
+                self.send(
+                    leader_id,
+                    Message::AppendEntriesResp {
+                        term: self.current_term,
+                        success: false,
+                        conflict_term,
+                        conflict_index,
+                    },
+                );
+                return;
+            }
+            Consistency::Match => {}
+        }
+
+        let base = prev_log_index + 1;
+        let mut first_new = entries.len();
+        for (i, entry) in entries.iter().enumerate() {
+            let idx = base + i as LogIndex;
+            if self.storage.term(idx).expect("raft storage") != Some(entry.term) {
+                first_new = i;
+                break;
+            }
+        }
+        if first_new < entries.len() {
+            self.storage.truncate_suffix(base + first_new as LogIndex).expect("raft storage");
+            self.persist_entries(entries[first_new..].to_vec());
+        } else {
+            // Everything sent is already here; drop any extra suffix beyond it.
+            let end = base + entries.len() as LogIndex;
+            if self.storage.last_index().expect("raft storage") >= end {
+                self.storage.truncate_suffix(end).expect("raft storage");
+            }
+        }
+
+        let last = self.storage.last_index().expect("raft storage");
+        if leader_commit > self.commit_index {
+            self.commit_index = leader_commit.min(last);
+            self.persist_hard_state();
+            self.outbox.push(Action::ApplyEntries { up_to: self.commit_index });
+        }
+
+        self.send(
+            leader_id,
+            Message::AppendEntriesResp {
+                term: self.current_term,
+                success: true,
+                conflict_term: None,
+                conflict_index: None,
+            },
+        );
+    }
+
+    /// Leader-side bookkeeping: advance `match_index` on success, backtrack
+    /// and resend immediately on rejection.
+    fn handle_append_entries_resp(
+        &mut self,
+        from: NodeId,
+        resp_term: Term,
+        success: bool,
+        conflict_term: Option<Term>,
+        conflict_index: Option<LogIndex>,
+    ) {
+        if self.role != Role::Leader || resp_term != self.current_term {
+            return;
+        }
+        if success {
+            if let Some(&end) = self.outstanding.get(&from) {
+                let matched = self.match_index.get(&from).copied().unwrap_or(0);
+                if end > matched {
+                    self.match_index.insert(from, end);
+                }
+                self.next_index.insert(from, end + 1);
+            }
+            // M3.5 advances the leader commit index here.
+        } else {
+            let current_next = self.next_index.get(&from).copied().unwrap_or(1);
+            let next = backtrack(current_next, conflict_term, conflict_index, &self.storage);
+            self.next_index.insert(from, next.max(1));
+            self.send_append(from);
+        }
+    }
+
+    /// Sends one `AppendEntries` covering everything from `next_index[to]`
+    /// onward — empty when the follower is caught up, in which case it is a
+    /// heartbeat. Records the covered end index for the success path above.
+    fn send_append(&mut self, to: NodeId) {
+        let next = self.next_index.get(&to).copied().unwrap_or(1);
+        let prev = next.saturating_sub(1);
+        let prev_term =
+            if prev == 0 { 0 } else { self.storage.term(prev).expect("raft storage").unwrap_or(0) };
+        let last = self.storage.last_index().expect("raft storage");
+        let entries = if next <= last {
+            self.storage.entries(next, last + 1).expect("raft storage")
+        } else {
+            Vec::new()
+        };
+        let end = prev + entries.len() as LogIndex;
+        self.outstanding.insert(to, end);
+        self.send(
+            to,
+            Message::AppendEntries {
+                term: self.current_term,
+                leader_id: self.config.id,
+                prev_log_index: prev,
+                prev_log_term: prev_term,
+                entries,
+                leader_commit: self.commit_index,
+            },
+        );
+    }
+
     fn send(&mut self, to: NodeId, msg: Message) {
         self.outbox.push(Action::Send { to, msg });
     }
@@ -330,6 +466,36 @@ impl<S: RaftStorage> RaftNode<S> {
     fn drain_actions(&mut self) -> Vec<Action> {
         std::mem::take(&mut self.outbox)
     }
+
+    /// Test-only: snapshot the full log for convergence assertions (M3.4) and
+    /// the invariant suite (M3.7).
+    #[cfg(test)]
+    pub(crate) fn log_entries(&self) -> Vec<Entry> {
+        self.storage.entries(1, LogIndex::MAX).expect("raft storage")
+    }
+
+    /// Test-only: install a divergent log fixture (paper figure 7).
+    #[cfg(test)]
+    pub(crate) fn replace_log_for_tests(&mut self, entries: Vec<Entry>) {
+        self.storage.truncate_suffix(1).expect("raft storage");
+        if !entries.is_empty() {
+            self.storage.append(&entries).expect("raft storage");
+        }
+    }
+
+    /// Test-only: suppress elections so a leader stays put under test.
+    #[cfg(test)]
+    pub(crate) fn set_election_timeout_for_tests(&mut self, timeout: u64) {
+        self.election_timeout = timeout;
+        self.election_elapsed = 0;
+    }
+
+    /// Test-only: force the next send position (e.g. past the follower's end
+    /// to exercise the conflict-hint path).
+    #[cfg(test)]
+    pub(crate) fn set_next_index_for_tests(&mut self, peer: NodeId, next: LogIndex) {
+        self.next_index.insert(peer, next);
+    }
 }
 
 fn random_timeout(rng: &mut StdRng, base: u64) -> u64 {
@@ -343,3 +509,7 @@ mod tests;
 #[cfg(test)]
 #[path = "tests/request_vote.rs"]
 mod request_vote_tests;
+
+#[cfg(test)]
+#[path = "tests/append_entries.rs"]
+mod append_entries_tests;
