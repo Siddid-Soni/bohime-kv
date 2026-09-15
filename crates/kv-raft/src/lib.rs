@@ -4,6 +4,7 @@
 //! execute. See plan Part 2 for the `Action`/`Ready` interface and M3 for
 //! the build sequence (types, election, replication, commitment, safety).
 
+pub mod election;
 pub mod log;
 pub mod message;
 pub mod node;
@@ -12,6 +13,9 @@ pub mod types;
 
 #[cfg(feature = "testing")]
 pub mod testing;
+
+#[cfg(test)]
+pub(crate) mod harness;
 
 pub use message::{Action, Config, Message, ProposeError, ReadState, Ready, Role};
 pub use node::RaftNode;

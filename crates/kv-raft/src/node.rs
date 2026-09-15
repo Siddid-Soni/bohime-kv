@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, HashSet};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
+use crate::election::{CandidateInfo, VoterState, should_grant_vote};
 use crate::log::last_log;
 use crate::message::{Action, Config, Message, Ready, Role};
 use crate::storage::RaftStorage;
@@ -95,17 +96,30 @@ impl<S: RaftStorage> RaftNode<S> {
     }
 
     /// Routes one inbound message through the term rules first, then dispatch.
-    pub fn step(&mut self, msg: Message) -> Vec<Action> {
+    /// `from` is the sender's id — vote and replication accounting must know
+    /// who answered, and anonymous votes would be double-countable.
+    pub fn step(&mut self, from: NodeId, msg: Message) -> Vec<Action> {
         let term = msg.term();
         if term > self.current_term {
             self.observe_higher_term(term);
         }
         match msg {
-            Message::RequestVote { .. } => {
-                // Full grant/deny rules at M3.3.
+            Message::RequestVote {
+                term: candidate_term,
+                candidate_id,
+                last_log_index,
+                last_log_term,
+            } => {
+                self.handle_request_vote(
+                    from,
+                    candidate_term,
+                    candidate_id,
+                    last_log_index,
+                    last_log_term,
+                );
             }
-            Message::RequestVoteResp { .. } => {
-                // Vote counting at M3.3.
+            Message::RequestVoteResp { term: resp_term, vote_granted } => {
+                self.handle_request_vote_resp(from, resp_term, vote_granted);
             }
             Message::AppendEntries {
                 term: msg_term,
@@ -239,6 +253,57 @@ impl<S: RaftStorage> RaftNode<S> {
         }
     }
 
+    fn handle_request_vote(
+        &mut self,
+        from: NodeId,
+        candidate_term: Term,
+        candidate_id: NodeId,
+        candidate_last_index: LogIndex,
+        candidate_last_term: Term,
+    ) {
+        let (voter_last_index, voter_last_term) = last_log(&self.storage);
+        let granted = should_grant_vote(
+            &CandidateInfo {
+                term: candidate_term,
+                id: candidate_id,
+                last_term: candidate_last_term,
+                last_index: candidate_last_index,
+            },
+            &VoterState {
+                current_term: self.current_term,
+                voted_for: self.voted_for,
+                last_term: voter_last_term,
+                last_index: voter_last_index,
+            },
+        );
+        if granted {
+            // Persist the vote before responding: a crash between grant and
+            // persist would let this node vote twice in one term.
+            self.voted_for = Some(candidate_id);
+            self.persist_hard_state();
+            if self.role != Role::Follower {
+                self.role = Role::Follower;
+            }
+            self.reset_election_timer();
+        }
+        self.send(
+            from,
+            Message::RequestVoteResp { term: self.current_term, vote_granted: granted },
+        );
+    }
+
+    fn handle_request_vote_resp(&mut self, from: NodeId, resp_term: Term, granted: bool) {
+        if self.role != Role::Candidate || resp_term != self.current_term {
+            return;
+        }
+        if granted {
+            self.votes_received.insert(from);
+            if self.votes_received.len() >= self.config.quorum() {
+                self.become_leader();
+            }
+        }
+    }
+
     fn send(&mut self, to: NodeId, msg: Message) {
         self.outbox.push(Action::Send { to, msg });
     }
@@ -274,3 +339,7 @@ fn random_timeout(rng: &mut StdRng, base: u64) -> u64 {
 #[cfg(test)]
 #[path = "tests/node_tick.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/request_vote.rs"]
+mod request_vote_tests;

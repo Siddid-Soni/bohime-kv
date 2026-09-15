@@ -56,14 +56,17 @@ fn heartbeat_suppresses_election_over_10k_ticks() {
     let mut node = RaftNode::new(config(1, vec![2, 3]), MemStorage::default());
 
     for _ in 0..10_000 {
-        node.step(Message::AppendEntries {
-            term: 0,
-            leader_id: 2,
-            prev_log_index: 0,
-            prev_log_term: 0,
-            entries: vec![],
-            leader_commit: 0,
-        });
+        node.step(
+            2,
+            Message::AppendEntries {
+                term: 0,
+                leader_id: 2,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: 0,
+            },
+        );
         assert_eq!(node.role(), Role::Follower);
     }
 }
