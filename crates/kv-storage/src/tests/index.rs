@@ -1,4 +1,4 @@
-use super::*;
+use crate::index::{HashMapIndex, KeyDirIndex, ValueLoc};
 
 #[test]
 fn get_after_insert_returns_loc() {

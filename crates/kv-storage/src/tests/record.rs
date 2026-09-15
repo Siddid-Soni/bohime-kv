@@ -1,4 +1,4 @@
-use super::*;
+use crate::record::{CodecError, FLAG_TOMBSTONE, HEADER_LEN, Record, checksum};
 
 #[test]
 fn encode_record() {

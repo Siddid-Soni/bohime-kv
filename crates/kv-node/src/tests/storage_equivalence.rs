@@ -1,4 +1,4 @@
-use super::*;
+use crate::storage::BitcaskStorage;
 use kv_raft::storage::MemStorage;
 use kv_raft::storage::RaftStorage;
 use kv_raft::types::Entry;

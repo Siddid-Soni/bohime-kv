@@ -1,4 +1,4 @@
-use super::*;
+use crate::config::{EngineConfig, FsyncPolicy};
 use std::time::Duration;
 
 #[test]

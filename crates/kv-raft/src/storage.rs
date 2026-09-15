@@ -119,7 +119,3 @@ impl RaftStorage for MemStorage {
         Ok(self.snapshot.clone())
     }
 }
-
-#[cfg(test)]
-#[path = "tests/storage.rs"]
-mod tests;

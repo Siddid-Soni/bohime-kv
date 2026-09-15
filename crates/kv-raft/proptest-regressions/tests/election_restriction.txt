@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 2122ec68376f43fd165f9dbf485f99854e20053c74957bae4b7321edf7f7b64c # shrinks to ops = [ForceElection(1), Propose, Propose, Propose, Tick(2), ForceElection(0), ForceElection(2), FallBehind(1, 0), ForceElection(1)]
+cc adbfc96a88451b4c268c285a49e67c5900e2b54d3dcc763bb842a330b1574571 # shrinks to ops = [Tick(3), Tick(1), Tick(1), Tick(5), Tick(1), ForceElection(0), ForceElection(2), FallBehind(1, 2), FallBehind(0, 0), ForceElection(0)]
+cc 0e598f02d06897d9426f77c0756ea54a0fbce64aec6595b5e640872d4feaca01 # shrinks to ops = [Tick(4), Tick(5), Isolate(1), Tick(2), Propose, Tick(1), Tick(3), Heal(1), Propose, ForceElection(1), Propose, Propose]

@@ -1,4 +1,9 @@
-use super::*;
+use crate::engine::{
+    CompactionManifest, Engine, MANIFEST_NAME, hint_file_name, read_hint_file, tmp_name,
+    write_hint_tmp, write_manifest,
+};
+use crate::index::ValueLoc;
+use crate::record::Record;
 use crate::{EngineConfig, FsyncPolicy};
 
 #[test]

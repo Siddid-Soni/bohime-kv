@@ -1,7 +1,7 @@
-use crate::harness::{Cluster, config};
 use crate::message::{Action, Message, Role};
 use crate::node::RaftNode;
 use crate::storage::MemStorage;
+use crate::tests::harness::{Cluster, config};
 use crate::types::{Entry, LogIndex, Term};
 
 fn entry(index: LogIndex, term: Term) -> Entry {

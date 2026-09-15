@@ -1,6 +1,6 @@
 // crc + timestamp + flags + key_len + value_len
-const HEADER_LEN: usize = 4 + 8 + 1 + 4 + 4;
-const FLAG_TOMBSTONE: u8 = 0x01;
+pub(crate) const HEADER_LEN: usize = 4 + 8 + 1 + 4 + 4;
+pub(crate) const FLAG_TOMBSTONE: u8 = 0x01;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum CodecError {
@@ -12,7 +12,7 @@ pub(crate) enum CodecError {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Record {
-    crc: u32,
+    pub(crate) crc: u32,
     timestamp: u64,
     pub(crate) is_tombstone: bool,
     pub(crate) key: Vec<u8>,
@@ -21,7 +21,7 @@ pub(crate) struct Record {
 
 /// CRC32 over everything the header covers except the CRC field itself:
 /// timestamp | flags | key_len | value_len | key | value.
-fn checksum(timestamp: u64, is_tombstone: bool, key: &[u8], value: &[u8]) -> u32 {
+pub(crate) fn checksum(timestamp: u64, is_tombstone: bool, key: &[u8], value: &[u8]) -> u32 {
     let mut hasher = crc32fast::Hasher::new();
     hasher.update(&timestamp.to_be_bytes());
     hasher.update(&[is_tombstone as u8]);
@@ -35,7 +35,13 @@ fn checksum(timestamp: u64, is_tombstone: bool, key: &[u8], value: &[u8]) -> u32
 impl Record {
     /// Test-only: constructs a record with a caller-chosen (possibly wrong)
     #[cfg(test)]
-    fn new(crc: u32, timestamp: u64, is_tombstone: bool, key: Vec<u8>, value: Vec<u8>) -> Self {
+    pub(crate) fn new(
+        crc: u32,
+        timestamp: u64,
+        is_tombstone: bool,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    ) -> Self {
         Self { crc, timestamp, is_tombstone, key, value }
     }
 
@@ -98,7 +104,3 @@ impl Record {
         Ok((Self { crc, timestamp, is_tombstone, key, value }, total_len))
     }
 }
-
-#[cfg(test)]
-#[path = "tests/record.rs"]
-mod tests;

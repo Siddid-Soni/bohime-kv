@@ -1,4 +1,4 @@
-use super::*;
+use crate::types::{Entry, HardState, Snapshot};
 
 #[test]
 fn entry_round_trips_through_bincode() {

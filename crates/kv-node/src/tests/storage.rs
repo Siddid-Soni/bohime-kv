@@ -1,31 +1,33 @@
-use super::*;
+use crate::storage::BitcaskStorage;
+use kv_raft::storage::RaftStorage;
 use kv_raft::types::{Entry, HardState};
 
-#[test]
-fn bitcask_storage_satisfies_the_conformance_suite() {
-    struct Harness {
-        dir: tempfile::TempDir,
-        generation: usize,
-    }
-    impl kv_raft::testing::StorageHarness for Harness {
-        type Storage = BitcaskStorage;
-
-        fn create(&mut self) -> BitcaskStorage {
-            self.generation += 1;
-            let path = self.dir.path().join(format!("gen-{}", self.generation));
-            BitcaskStorage::open(path).unwrap()
-        }
-
-        fn reopen(&mut self, s: BitcaskStorage) -> BitcaskStorage {
-            let path = s.path().to_path_buf();
-            drop(s);
-            BitcaskStorage::open(path).unwrap()
-        }
-    }
-
-    let mut harness = Harness { dir: tempfile::tempdir().unwrap(), generation: 0 };
-    kv_raft::testing::assert_storage_conformance(&mut harness);
+struct ConformanceHarness {
+    dir: tempfile::TempDir,
+    generation: usize,
 }
+
+impl kv_raft::conformance::StorageHarness for ConformanceHarness {
+    type Storage = BitcaskStorage;
+
+    /// A fresh directory per store, so `create` never reopens a previous one.
+    fn create(&mut self) -> BitcaskStorage {
+        self.generation += 1;
+        let path = self.dir.path().join(format!("gen-{}", self.generation));
+        BitcaskStorage::open(path).unwrap()
+    }
+
+    fn reopen(&mut self, s: BitcaskStorage) -> BitcaskStorage {
+        let path = s.path().to_path_buf();
+        drop(s);
+        BitcaskStorage::open(path).unwrap()
+    }
+}
+
+kv_raft::raft_storage_conformance!(
+    bitcask,
+    ConformanceHarness { dir: tempfile::tempdir().unwrap(), generation: 0 }
+);
 
 #[test]
 fn entries_are_readable_after_a_reopen_without_rewriting_hard_state() {

@@ -529,14 +529,17 @@ impl<S: RaftStorage> RaftNode<S> {
         self.outbox[checkpoint..].to_vec()
     }
 
-    /// Test-only: snapshot the full log for convergence assertions (M3.4) and
-    /// the invariant suite (M3.7).
-    #[cfg(test)]
-    pub(crate) fn log_entries(&self) -> Vec<Entry> {
+    /// Every entry currently in the log. Inspection only — M4's invariant
+    /// checker compares these across nodes to verify Log Matching.
+    pub fn log_entries(&self) -> Vec<Entry> {
         self.storage.entries(1, LogIndex::MAX).expect("raft storage")
     }
 
-    /// Test-only: install a divergent log fixture (paper figure 7).
+    // The three hooks below force a node into a state that would take many
+    // ticks to reach naturally (a divergent log, a stale next_index, a node
+    // that never times out). Test-only; kv-sim may need them promoted to `pub`
+    // for fault injection at M4.
+    /// Installs a divergent log fixture (paper figure 7).
     #[cfg(test)]
     pub(crate) fn replace_log_for_tests(&mut self, entries: Vec<Entry>) {
         self.storage.truncate_suffix(1).expect("raft storage");
@@ -545,15 +548,15 @@ impl<S: RaftStorage> RaftNode<S> {
         }
     }
 
-    /// Test-only: suppress elections so a leader stays put under test.
+    /// Suppresses elections, so a leader stays put while a test drives it.
     #[cfg(test)]
     pub(crate) fn set_election_timeout_for_tests(&mut self, timeout: u64) {
         self.election_timeout = timeout;
         self.election_elapsed = 0;
     }
 
-    /// Test-only: force the next send position (e.g. past the follower's end
-    /// to exercise the conflict-hint path).
+    /// Forces the next send position — e.g. past the follower's end, to
+    /// exercise the conflict-hint path.
     #[cfg(test)]
     pub(crate) fn set_next_index_for_tests(&mut self, peer: NodeId, next: LogIndex) {
         self.next_index.insert(peer, next);
@@ -563,19 +566,3 @@ impl<S: RaftStorage> RaftNode<S> {
 fn random_timeout(rng: &mut StdRng, base: u64) -> u64 {
     rng.gen_range(base..base * 2)
 }
-
-#[cfg(test)]
-#[path = "tests/node_tick.rs"]
-mod tests;
-
-#[cfg(test)]
-#[path = "tests/request_vote.rs"]
-mod request_vote_tests;
-
-#[cfg(test)]
-#[path = "tests/append_entries.rs"]
-mod append_entries_tests;
-
-#[cfg(test)]
-#[path = "tests/commit.rs"]
-mod commit_tests;

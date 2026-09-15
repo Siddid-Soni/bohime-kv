@@ -1,5 +1,5 @@
-use super::*;
 use crate::message::{Action, Config, Message, Role};
+use crate::node::RaftNode;
 use crate::storage::MemStorage;
 
 fn config(id: u64, peers: Vec<u64>) -> Config {

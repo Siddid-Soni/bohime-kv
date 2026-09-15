@@ -5,9 +5,4 @@
 //! at M10.
 
 #[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_wires_up() {
-        assert_eq!(2 + 2, 4);
-    }
-}
+mod tests;

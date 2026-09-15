@@ -154,7 +154,3 @@ impl std::fmt::Display for ProposeError {
 }
 
 impl std::error::Error for ProposeError {}
-
-#[cfg(test)]
-#[path = "tests/message.rs"]
-mod tests;

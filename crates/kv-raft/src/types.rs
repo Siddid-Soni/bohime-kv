@@ -41,7 +41,3 @@ pub struct Snapshot {
     pub last_included_term: Term,
     pub data: Vec<u8>,
 }
-
-#[cfg(test)]
-#[path = "tests/types.rs"]
-mod tests;

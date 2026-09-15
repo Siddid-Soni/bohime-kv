@@ -1,7 +1,7 @@
-use crate::harness::{Cluster, config};
 use crate::message::{Action, Message, Role};
 use crate::node::RaftNode;
 use crate::storage::MemStorage;
+use crate::tests::harness::{Cluster, config};
 
 #[test]
 fn candidate_with_majority_becomes_leader() {

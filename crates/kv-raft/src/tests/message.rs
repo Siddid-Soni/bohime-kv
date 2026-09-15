@@ -1,4 +1,4 @@
-use super::*;
+use crate::message::{Config, Message, Ready};
 use crate::types::{Entry, HardState};
 
 fn sample_entry() -> Entry {

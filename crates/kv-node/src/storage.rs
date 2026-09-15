@@ -157,11 +157,3 @@ impl RaftStorage for BitcaskStorage {
         Ok(None)
     }
 }
-
-#[cfg(test)]
-#[path = "tests/storage.rs"]
-mod tests;
-
-#[cfg(test)]
-#[path = "tests/storage_equivalence.rs"]
-mod storage_equivalence;

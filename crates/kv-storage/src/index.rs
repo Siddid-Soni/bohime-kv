@@ -60,7 +60,3 @@ impl KeyDirIndex for HashMapIndex {
         self.map.iter().map(|(k, v)| (k.clone(), *v)).collect()
     }
 }
-
-#[cfg(test)]
-#[path = "tests/index.rs"]
-mod tests;

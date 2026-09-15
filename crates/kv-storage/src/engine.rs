@@ -38,7 +38,7 @@ fn open_segment(dir: &Path, id: SegmentId) -> io::Result<File> {
     OpenOptions::new().create(true).read(true).append(true).open(dir.join(segment_file_name(id)))
 }
 
-fn hint_file_name(id: SegmentId) -> String {
+pub(crate) fn hint_file_name(id: SegmentId) -> String {
     format!("{id:020}.hint")
 }
 
@@ -49,7 +49,11 @@ type HintEntries = Vec<(Vec<u8>, ValueLoc)>;
 /// Writes a segment's hint entries to `{id}.hint.tmp`. The rename into place
 /// is `finish_compaction`'s job, so a hint file never exists describing a
 /// segment that was not also renamed into place.
-fn write_hint_tmp(dir: &Path, id: SegmentId, entries: &[(Vec<u8>, ValueLoc)]) -> io::Result<()> {
+pub(crate) fn write_hint_tmp(
+    dir: &Path,
+    id: SegmentId,
+    entries: &[(Vec<u8>, ValueLoc)],
+) -> io::Result<()> {
     let mut buf = Vec::new();
     for (key, loc) in entries {
         buf.extend_from_slice(&loc.offset.to_be_bytes());
@@ -65,7 +69,7 @@ fn write_hint_tmp(dir: &Path, id: SegmentId, entries: &[(Vec<u8>, ValueLoc)]) ->
 /// from the segment itself. A hint file is a cache of information the segment
 /// already contains, so a bad one is a performance problem, never a
 /// correctness one, and must not fail the open.
-fn read_hint_file(dir: &Path, id: SegmentId) -> io::Result<Option<HintEntries>> {
+pub(crate) fn read_hint_file(dir: &Path, id: SegmentId) -> io::Result<Option<HintEntries>> {
     let path = dir.join(hint_file_name(id));
     if !path.exists() {
         return Ok(None);
@@ -108,17 +112,17 @@ fn parse_hint_entries(data: &[u8], id: SegmentId) -> Option<HintEntries> {
 /// and the retired segments may be unlinked; `open` replays the remaining
 /// steps before touching anything else, which is what makes an interrupted
 /// compaction safe rather than corrupting.
-const MANIFEST_NAME: &str = "compaction.manifest";
+pub(crate) const MANIFEST_NAME: &str = "compaction.manifest";
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CompactionManifest {
     /// `None` when every retired segment was entirely dead, so there is no
     /// merged output at all — only deletions to finish.
-    new_id: Option<SegmentId>,
-    old_ids: Vec<SegmentId>,
+    pub(crate) new_id: Option<SegmentId>,
+    pub(crate) old_ids: Vec<SegmentId>,
 }
 
-fn tmp_name(name: &str) -> String {
+pub(crate) fn tmp_name(name: &str) -> String {
     format!("{name}.tmp")
 }
 
@@ -439,7 +443,7 @@ impl Engine {
     /// `apply_compaction` so a caller can force an overwrite to land between
     /// the snapshot and the relocation it drives — the exact race compaction
     /// must not lose to once a real concurrent writer exists (M11.5).
-    fn plan_compaction(&mut self) -> io::Result<Option<CompactionPlan>> {
+    pub(crate) fn plan_compaction(&mut self) -> io::Result<Option<CompactionPlan>> {
         let old_segment_ids: Vec<SegmentId> =
             self.segments.keys().copied().filter(|&id| id != self.active_id).collect();
         if old_segment_ids.is_empty() {
@@ -475,7 +479,7 @@ impl Engine {
     /// after it is replayable by `finish_compaction`. That is what keeps a
     /// crash mid-compaction from either losing the merge or letting a stale
     /// retired segment replay over it.
-    fn apply_compaction(&mut self, plan: CompactionPlan) -> io::Result<()> {
+    pub(crate) fn apply_compaction(&mut self, plan: CompactionPlan) -> io::Result<()> {
         let CompactionPlan { old_segment_ids, new_segment_id, entries } = plan;
 
         let manifest = if entries.is_empty() {
@@ -526,12 +530,8 @@ impl Engine {
     }
 }
 
-struct CompactionPlan {
-    old_segment_ids: Vec<SegmentId>,
-    new_segment_id: SegmentId,
+pub(crate) struct CompactionPlan {
+    pub(crate) old_segment_ids: Vec<SegmentId>,
+    pub(crate) new_segment_id: SegmentId,
     entries: Vec<(Vec<u8>, ValueLoc, Vec<u8>)>,
 }
-
-#[cfg(test)]
-#[path = "tests/engine.rs"]
-mod tests;

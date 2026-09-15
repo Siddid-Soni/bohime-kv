@@ -8,6 +8,7 @@ mod config;
 mod engine;
 mod index;
 mod record;
-
+#[cfg(test)]
+mod tests;
 pub use config::{EngineConfig, FsyncPolicy};
 pub use engine::Engine;

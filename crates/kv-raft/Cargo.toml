@@ -17,10 +17,4 @@ rand.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
-kv-raft = { path = ".", features = ["testing"] }
 
-[features]
-# Exposes the RaftStorage conformance suite so other crates (kv-node) can run
-# the identical assertions against their own impls. Off by default so test-only
-# code never reaches a release build.
-testing = []

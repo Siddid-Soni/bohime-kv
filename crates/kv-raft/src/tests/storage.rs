@@ -69,19 +69,3 @@ fn hard_state_round_trips() {
     s.save_hard_state(&hs).unwrap();
     assert_eq!(s.hard_state().unwrap(), hs);
 }
-
-#[cfg(feature = "testing")]
-#[test]
-fn mem_storage_satisfies_the_conformance_suite() {
-    struct Harness;
-    impl crate::testing::StorageHarness for Harness {
-        type Storage = MemStorage;
-        fn create(&mut self) -> MemStorage {
-            MemStorage::default()
-        }
-        fn reopen(&mut self, s: MemStorage) -> MemStorage {
-            s
-        }
-    }
-    crate::testing::assert_storage_conformance(&mut Harness);
-}

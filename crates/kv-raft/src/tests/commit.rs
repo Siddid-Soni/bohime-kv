@@ -1,5 +1,5 @@
-use crate::harness::Cluster;
 use crate::message::ProposeError;
+use crate::tests::harness::Cluster;
 use crate::types::Entry;
 
 fn drain_committed(cluster: &mut Cluster) -> Vec<Vec<Entry>> {

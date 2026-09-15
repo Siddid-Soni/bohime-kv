@@ -50,7 +50,3 @@ impl Default for EngineConfig {
         Self { max_segment_size: 64 * 1024 * 1024, fsync_policy: FsyncPolicy::EveryWrite }
     }
 }
-
-#[cfg(test)]
-#[path = "tests/config.rs"]
-mod tests;
