@@ -4,6 +4,8 @@
 use crate::message::{Action, Config, Message, Role};
 use crate::node::RaftNode;
 use crate::storage::MemStorage;
+use std::collections::HashSet;
+
 use crate::types::NodeId;
 
 pub fn config(id: NodeId, peers: Vec<NodeId>, seed: u64) -> Config {
@@ -12,6 +14,11 @@ pub fn config(id: NodeId, peers: Vec<NodeId>, seed: u64) -> Config {
 
 pub struct Cluster {
     pub nodes: Vec<RaftNode<MemStorage>>,
+    /// Nodes cut off from the network. Messages to and from them are dropped
+    /// rather than queued — a partition, not a delay. Needed because several
+    /// Raft rules (notably the election restriction) only become load-bearing
+    /// once a node can miss entries the rest of the cluster commits without it.
+    isolated: HashSet<NodeId>,
 }
 
 impl Cluster {
@@ -27,7 +34,21 @@ impl Cluster {
                 RaftNode::new(config(id, peers, 1000 + id), MemStorage::default())
             })
             .collect();
-        Self { nodes }
+        Self { nodes, isolated: HashSet::new() }
+    }
+
+    /// Cut `id` off from the rest of the cluster until [`Cluster::heal`].
+    pub fn isolate(&mut self, id: NodeId) {
+        self.isolated.insert(id);
+    }
+
+    /// Reconnect `id`. It stays behind until replication catches it up.
+    pub fn heal(&mut self, id: NodeId) {
+        self.isolated.remove(&id);
+    }
+
+    fn partitioned(&self, from: NodeId, to: NodeId) -> bool {
+        self.isolated.contains(&from) || self.isolated.contains(&to)
     }
 
     /// Tick every node once, then deliver all resulting messages (and their
@@ -52,6 +73,9 @@ impl Cluster {
             }
             let mut next = Vec::new();
             for (from, to, msg) in pending.drain(..) {
+                if self.partitioned(from, to) {
+                    continue;
+                }
                 if let Some(node) = self.nodes.iter_mut().find(|n| n.id() == to) {
                     let responder = node.id();
                     for action in node.step(from, msg) {

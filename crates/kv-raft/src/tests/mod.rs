@@ -10,6 +10,7 @@ pub(crate) mod harness;
 mod append_entries;
 mod commit;
 mod conformance;
+mod election_restriction;
 mod message;
 mod node_tick;
 mod request_vote;
