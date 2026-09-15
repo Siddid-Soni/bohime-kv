@@ -370,7 +370,166 @@ fn overwrite_during_compaction_keeps_new_value() {
     assert_eq!(engine.get(b"k").unwrap(), Some(b"new".to_vec()));
 }
 
+// --- M1.6: crash safety — torn tail (Task 1), tests only ---
+
 use proptest::strategy::Strategy;
+
+fn segment_path(dir: &std::path::Path, id: u32) -> std::path::PathBuf {
+    dir.join(format!("{id:020}.seg"))
+}
+
+fn truncate_to(path: &std::path::Path, new_len: u64) {
+    std::fs::OpenOptions::new().write(true).open(path).unwrap().set_len(new_len).unwrap();
+}
+
+fn file_len(path: &std::path::Path) -> u64 {
+    std::fs::metadata(path).unwrap().len()
+}
+
+#[test]
+fn reopen_after_torn_tail_recovers_prior_records() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut engine = Engine::open(dir.path()).unwrap();
+        engine.put(b"a", b"1").unwrap();
+        engine.put(b"b", b"2").unwrap();
+    }
+
+    let path = segment_path(dir.path(), 0);
+    truncate_to(&path, file_len(&path) - 1);
+
+    let mut engine = Engine::open(dir.path()).unwrap();
+    assert_eq!(engine.get(b"a").unwrap(), Some(b"1".to_vec()));
+    assert_eq!(engine.get(b"b").unwrap(), None, "torn record must not be resurrected");
+}
+
+#[test]
+fn every_truncation_offset_in_the_final_record_recovers() {
+    // The final record's encoded length: HEADER_LEN(21) + key + value.
+    for cut in 1..=(21 + 1 + 2) {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut engine = Engine::open(dir.path()).unwrap();
+            engine.put(b"a", b"11").unwrap();
+            engine.put(b"b", b"22").unwrap();
+        }
+
+        let path = segment_path(dir.path(), 0);
+        let intact_len = file_len(&path) - (21 + 1 + 2);
+        truncate_to(&path, file_len(&path) - cut as u64);
+
+        let mut engine = Engine::open(dir.path()).unwrap();
+        assert_eq!(engine.get(b"a").unwrap(), Some(b"11".to_vec()), "cut={cut}");
+        assert_eq!(engine.get(b"b").unwrap(), None, "cut={cut}");
+        assert_eq!(file_len(&path), intact_len, "torn tail must be truncated away, cut={cut}");
+    }
+}
+
+#[test]
+fn write_after_torn_tail_recovery_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut engine = Engine::open(dir.path()).unwrap();
+        engine.put(b"a", b"1").unwrap();
+        engine.put(b"b", b"2").unwrap();
+    }
+
+    let path = segment_path(dir.path(), 0);
+    truncate_to(&path, file_len(&path) - 3);
+
+    {
+        let mut engine = Engine::open(dir.path()).unwrap();
+        engine.put(b"c", b"3").unwrap();
+    }
+
+    let mut engine = Engine::open(dir.path()).unwrap();
+    assert_eq!(engine.get(b"a").unwrap(), Some(b"1".to_vec()));
+    assert_eq!(engine.get(b"c").unwrap(), Some(b"3".to_vec()));
+}
+
+#[test]
+fn torn_tombstone_leaves_the_key_present() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut engine = Engine::open(dir.path()).unwrap();
+        engine.put(b"a", b"1").unwrap();
+        engine.delete(b"a").unwrap();
+    }
+
+    let path = segment_path(dir.path(), 0);
+    truncate_to(&path, file_len(&path) - 1);
+
+    // The delete never became durable, so the key must still be there. A
+    // half-written tombstone taking effect would be the engine inventing a
+    // deletion the caller was never told had succeeded.
+    let mut engine = Engine::open(dir.path()).unwrap();
+    assert_eq!(engine.get(b"a").unwrap(), Some(b"1".to_vec()));
+}
+
+#[test]
+fn corrupt_byte_in_final_record_is_treated_as_a_torn_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut engine = Engine::open(dir.path()).unwrap();
+        engine.put(b"a", b"1").unwrap();
+        engine.put(b"b", b"2").unwrap();
+    }
+
+    let path = segment_path(dir.path(), 0);
+    let mut bytes = std::fs::read(&path).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xff;
+    std::fs::write(&path, &bytes).unwrap();
+
+    let mut engine = Engine::open(dir.path()).unwrap();
+    assert_eq!(engine.get(b"a").unwrap(), Some(b"1".to_vec()));
+    assert_eq!(engine.get(b"b").unwrap(), None);
+}
+
+#[test]
+fn trailing_garbage_is_truncated_away() {
+    let dir = tempfile::tempdir().unwrap();
+    let intact_len = {
+        let mut engine = Engine::open(dir.path()).unwrap();
+        engine.put(b"a", b"1").unwrap();
+        file_len(&segment_path(dir.path(), 0))
+    };
+
+    let path = segment_path(dir.path(), 0);
+    let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+    std::io::Write::write_all(&mut file, &[0xde, 0xad, 0xbe, 0xef]).unwrap();
+    drop(file);
+
+    let mut engine = Engine::open(dir.path()).unwrap();
+    assert_eq!(engine.get(b"a").unwrap(), Some(b"1".to_vec()));
+    assert_eq!(file_len(&path), intact_len);
+}
+
+#[test]
+fn torn_closed_segment_is_rejected_rather_than_silently_truncated() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        // A 64-byte cap forces rotation, so segment 0 closes.
+        let mut engine = Engine::open_with_max_segment_size(dir.path(), 64).unwrap();
+        for i in 0..20u32 {
+            engine.put(format!("key-{i}").as_bytes(), format!("value-{i}").as_bytes()).unwrap();
+        }
+    }
+
+    // Segment 0 is closed by construction. A crash cannot tear a closed
+    // segment, so a tear here is real corruption of data that was already
+    // durable — discarding it silently would be data loss dressed up as
+    // recovery.
+    let path = segment_path(dir.path(), 0);
+    truncate_to(&path, file_len(&path) - 1);
+
+    let err = match Engine::open_with_max_segment_size(dir.path(), 64) {
+        Ok(_) => panic!("open should reject torn closed segment"),
+        Err(e) => e,
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(err.to_string().contains("segment 0"), "error must name the segment: {err}");
+}
 
 #[derive(Debug, Clone)]
 enum Op {

@@ -20,9 +20,7 @@ pub(crate) struct Record {
 }
 
 /// CRC32 over everything the header covers except the CRC field itself:
-/// timestamp | flags | key_len | value_len | key | value. The tombstone
-/// flag is included so a corrupted flag byte is caught rather than silently
-/// resurrecting or deleting the wrong thing.
+/// timestamp | flags | key_len | value_len | key | value. 
 fn checksum(timestamp: u64, is_tombstone: bool, key: &[u8], value: &[u8]) -> u32 {
     let mut hasher = crc32fast::Hasher::new();
     hasher.update(&timestamp.to_be_bytes());
@@ -36,17 +34,13 @@ fn checksum(timestamp: u64, is_tombstone: bool, key: &[u8], value: &[u8]) -> u32
 
 impl Record {
     /// Test-only: constructs a record with a caller-chosen (possibly wrong)
-    /// crc, for tests that need to check raw byte layout or corruption
-    /// handling independent of `create`'s checksum computation.
     #[cfg(test)]
     fn new(crc: u32, timestamp: u64, is_tombstone: bool, key: Vec<u8>, value: Vec<u8>) -> Self {
         Self { crc, timestamp, is_tombstone, key, value }
     }
 
     /// Builds a record with a correctly computed checksum. This is the
-    /// constructor real callers should use; `new` stays available for tests
-    /// that deliberately need to construct a record with a specific
-    /// (possibly wrong) crc.
+    /// constructor real callers should use; 
     pub(crate) fn create(timestamp: u64, key: Vec<u8>, value: Vec<u8>) -> Self {
         let crc = checksum(timestamp, false, &key, &value);
         Self { crc, timestamp, is_tombstone: false, key, value }
