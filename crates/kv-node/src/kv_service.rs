@@ -45,12 +45,12 @@ fn not_leader(hint: Option<u64>) -> pb::NotLeader {
 
 #[tonic::async_trait]
 impl KvService for KvApi {
-    /// **Deliberately stale (M6).** This reads local state, so a deposed
-    /// leader that has not yet learned it lost will serve its old value. The
-    /// gate for this milestone is "get k on any node returns it", and M7
-    /// replaces this with ReadIndex — §M7 requires writing that test against
-    /// *this* implementation first and watching it fail. Do not mistake it for
-    /// a finished path.
+    /// Linearizable since M7: served through ReadIndex, so only a leader that
+    /// can confirm a quorum answers. A follower redirects.
+    ///
+    /// M6 read local state here, which let a deposed leader serve a value that
+    /// had already been overwritten — `tests::linearizability` reproduces that
+    /// exact violation and now guards against it.
     async fn get(
         &self,
         request: Request<pb::GetRequest>,
@@ -59,6 +59,14 @@ impl KvService for KvApi {
             ClientReply::Value(value) => {
                 Ok(Response::new(pb::GetResponse { value, not_leader: None }))
             }
+            // Since M7 a read needs a leadership quorum, so a follower
+            // redirects exactly as it does for a write. This is an ordinary
+            // answer, not an error: reporting it as one would have the client
+            // drop the connection instead of following the hint.
+            ClientReply::NotLeader { hint } => Ok(Response::new(pb::GetResponse {
+                value: None,
+                not_leader: Some(not_leader(hint)),
+            })),
             other => Err(Status::internal(format!("driver answered a get with {other:?}"))),
         }
     }

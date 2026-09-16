@@ -298,6 +298,9 @@ impl<S: RaftStorage> RaftNode<S> {
         self.read_round += 1;
         self.round_acks.clear();
         self.broadcast_heartbeats();
+        // A group of one is already a quorum; for anything larger this
+        // declines and the peers' acks decide.
+        self.try_confirm_reads();
         Ok(())
     }
 
@@ -555,13 +558,7 @@ impl<S: RaftStorage> RaftNode<S> {
         // is visible only under a partition.
         if read_round == Some(self.read_round) && !self.pending_reads.is_empty() {
             self.round_acks.insert(from);
-            // +1 for the leader, which trivially holds its own log.
-            if self.round_acks.len() + 1 >= self.config.quorum() {
-                for (token, index) in self.pending_reads.drain(..) {
-                    self.confirmed_reads.push(ReadState { token, index });
-                }
-                self.round_acks.clear();
-            }
+            self.try_confirm_reads();
         }
         if success {
             // Monotonic: a delayed or duplicated reply to an older, shorter
@@ -641,6 +638,24 @@ impl<S: RaftStorage> RaftNode<S> {
                 },
             },
         );
+    }
+
+    /// Confirms every outstanding read once this round has a quorum behind it.
+    ///
+    /// The `+ 1` is the leader itself, which trivially holds its own log — and
+    /// it is what makes a group of one work. Without calling this from
+    /// `read_index` too, a lone leader would wait forever for an ack no peer
+    /// will ever send, exactly as the commit rule did before M6.
+    fn try_confirm_reads(&mut self) {
+        if self.pending_reads.is_empty() {
+            return;
+        }
+        if self.round_acks.len() + 1 >= self.config.quorum() {
+            for (token, index) in self.pending_reads.drain(..) {
+                self.confirmed_reads.push(ReadState { token, index });
+            }
+            self.round_acks.clear();
+        }
     }
 
     /// Drops every outstanding read. Called on any loss of leadership: a

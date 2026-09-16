@@ -58,10 +58,13 @@ async fn call(tx: &mpsc::Sender<ClientRequest>, op: ClientOp) -> ClientReply {
 }
 
 /// Retries through `NotLeader`, which is what a real client does (kv-client
-/// does exactly this). A write issued before the lone node's election timeout
-/// has elapsed is legitimately refused — that is the driver working, not
-/// failing, so the test must not treat the first refusal as the answer.
-async fn write(tx: &mpsc::Sender<ClientRequest>, op: impl Fn() -> ClientOp) -> ClientReply {
+/// does exactly this). A request issued before the lone node's election
+/// timeout has elapsed is legitimately refused — that is the driver working,
+/// not failing, so the test must not treat the first refusal as the answer.
+///
+/// Since M7 this applies to reads too: a `Get` goes through ReadIndex, so only
+/// a leader that can confirm a quorum answers one.
+async fn retrying(tx: &mpsc::Sender<ClientRequest>, op: impl Fn() -> ClientOp) -> ClientReply {
     for _ in 0..200 {
         match call(tx, op()).await {
             ClientReply::NotLeader { .. } => {
@@ -73,15 +76,19 @@ async fn write(tx: &mpsc::Sender<ClientRequest>, op: impl Fn() -> ClientOp) -> C
     panic!("no leader emerged in 2s");
 }
 
+async fn read(tx: &mpsc::Sender<ClientRequest>, key: &[u8]) -> ClientReply {
+    retrying(tx, || ClientOp::Get { key: key.to_vec() }).await
+}
+
 #[tokio::test]
 async fn a_put_is_committed_then_readable() {
     let dir = tempfile::tempdir().unwrap();
     let (tx, _keep) = spawn(&config(dir.path(), BTreeMap::new()));
 
-    let reply = write(&tx, || ClientOp::Put { key: b"k".to_vec(), value: b"v".to_vec() }).await;
+    let reply = retrying(&tx, || ClientOp::Put { key: b"k".to_vec(), value: b"v".to_vec() }).await;
     assert!(matches!(reply, ClientReply::Applied), "got {reply:?}");
 
-    let reply = call(&tx, ClientOp::Get { key: b"k".to_vec() }).await;
+    let reply = read(&tx, b"k").await;
     assert!(matches!(reply, ClientReply::Value(Some(ref v)) if v == b"v"), "got {reply:?}");
 }
 
@@ -90,11 +97,11 @@ async fn a_delete_removes_the_key() {
     let dir = tempfile::tempdir().unwrap();
     let (tx, _keep) = spawn(&config(dir.path(), BTreeMap::new()));
 
-    write(&tx, || ClientOp::Put { key: b"k".to_vec(), value: b"v".to_vec() }).await;
-    let reply = write(&tx, || ClientOp::Delete { key: b"k".to_vec() }).await;
+    retrying(&tx, || ClientOp::Put { key: b"k".to_vec(), value: b"v".to_vec() }).await;
+    let reply = retrying(&tx, || ClientOp::Delete { key: b"k".to_vec() }).await;
     assert!(matches!(reply, ClientReply::Applied), "got {reply:?}");
 
-    let reply = call(&tx, ClientOp::Get { key: b"k".to_vec() }).await;
+    let reply = read(&tx, b"k").await;
     assert!(matches!(reply, ClientReply::Value(None)), "got {reply:?}");
 }
 
@@ -103,7 +110,7 @@ async fn a_missing_key_reads_as_none() {
     let dir = tempfile::tempdir().unwrap();
     let (tx, _keep) = spawn(&config(dir.path(), BTreeMap::new()));
 
-    let reply = call(&tx, ClientOp::Get { key: b"absent".to_vec() }).await;
+    let reply = read(&tx, b"absent").await;
     assert!(matches!(reply, ClientReply::Value(None)), "got {reply:?}");
 }
 
@@ -115,7 +122,8 @@ async fn applied_writes_survive_a_restart() {
     let config = config(dir.path(), BTreeMap::new());
 
     let (first, keep) = spawn(&config);
-    let reply = write(&first, || ClientOp::Put { key: b"k".to_vec(), value: b"v".to_vec() }).await;
+    let reply =
+        retrying(&first, || ClientOp::Put { key: b"k".to_vec(), value: b"v".to_vec() }).await;
     assert!(matches!(reply, ClientReply::Applied), "got {reply:?}");
     drop((first, keep));
     // Let the old driver observe its closed channels and release the Bitcask
@@ -123,7 +131,7 @@ async fn applied_writes_survive_a_restart() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let (second, _keep) = spawn(&config);
-    let reply = call(&second, ClientOp::Get { key: b"k".to_vec() }).await;
+    let reply = read(&second, b"k").await;
     assert!(matches!(reply, ClientReply::Value(Some(ref v)) if v == b"v"), "got {reply:?}");
 }
 
@@ -141,9 +149,15 @@ async fn a_follower_refuses_a_write_instead_of_applying_it() {
     let reply = call(&tx, ClientOp::Put { key: b"k".to_vec(), value: b"v".to_vec() }).await;
     assert!(matches!(reply, ClientReply::NotLeader { .. }), "got {reply:?}");
 
-    // And it did not quietly apply anyway.
+    // Since M7 it cannot serve the read either: a linearizable read needs a
+    // leadership quorum, and this node has no peers that answer. Before M7 it
+    // would have answered from local state, which is exactly the behaviour
+    // `tests::linearizability` showed to be unsafe.
     let reply = call(&tx, ClientOp::Get { key: b"k".to_vec() }).await;
-    assert!(matches!(reply, ClientReply::Value(None)), "a refused write must not land: {reply:?}");
+    assert!(
+        matches!(reply, ClientReply::NotLeader { .. }),
+        "a node that cannot reach a quorum must not serve a read: {reply:?}"
+    );
 }
 
 #[tokio::test]

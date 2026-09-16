@@ -98,15 +98,40 @@ impl Client {
         }
     }
 
-    /// Reads are served locally by any node at M6, so the first node that
-    /// answers wins. That is also why this read can be stale — M7 fixes it.
+    /// Reads go to the leader and follow `NotLeader` hints, exactly as writes
+    /// do. Before M7 any node answered a read from local state; that is what
+    /// made the read non-linearizable, so the cheaper path is gone on purpose.
     pub async fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, ClientError> {
         let mut last = None;
+        let mut hinted: Option<NodeId> = None;
+
         for _ in 0..RETRY_ROUNDS {
-            for id in self.candidates() {
+            let order = match hinted.take() {
+                Some(id) if self.endpoints.contains_key(&id) => vec![id],
+                _ => self.candidates(),
+            };
+
+            for id in order {
                 let Some(channel) = self.channel(id).await else { continue };
                 match KvServiceClient::new(channel).get(GetRequest { key: key.to_vec() }).await {
-                    Ok(resp) => return Ok(resp.into_inner().value),
+                    Ok(resp) => {
+                        let resp = resp.into_inner();
+                        match resp.not_leader {
+                            None => {
+                                self.leader = Some(id);
+                                return Ok(resp.value);
+                            }
+                            Some(not_leader) => {
+                                self.leader = None;
+                                if not_leader.leader_hint != 0
+                                    && self.endpoints.contains_key(&not_leader.leader_hint)
+                                {
+                                    hinted = Some(not_leader.leader_hint);
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     Err(status) => {
                         last = Some(status.to_string());
                         self.forget(id);

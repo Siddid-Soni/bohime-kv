@@ -247,6 +247,26 @@ impl Cluster {
         self.put_among(&ALL, key, value).await
     }
 
+    /// Reads via whichever of `among` can serve it, retrying through
+    /// `NotLeader`. Since M7 that is the leader alone: a linearizable read
+    /// needs a leadership quorum, so a follower refuses rather than answering
+    /// from local state.
+    pub(crate) async fn read_among(&self, among: &[NodeId], key: &[u8]) -> Option<Vec<u8>> {
+        for _ in 0..200 {
+            for &id in among {
+                if let ClientReply::Value(value) = self.get_from(id, key).await {
+                    return value;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("no node among {among:?} served a read in 4s");
+    }
+
+    pub(crate) async fn read(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.read_among(&ALL, key).await
+    }
+
     /// Real time passes here, so a wait is a real wait.
     pub(crate) async fn settle(&self, how_long: Duration) {
         tokio::time::sleep(how_long).await;
@@ -265,10 +285,27 @@ mod smoke {
         assert!(ALL.contains(&leader));
 
         cluster.settle(Duration::from_millis(500)).await;
-        for &id in &ALL {
+        assert_eq!(cluster.read(b"k").await, Some(b"v".to_vec()));
+    }
+
+    /// M6 let every node answer a `Get` from local state, and
+    /// `tests::linearizability` showed what that permits. Since M7 a read
+    /// takes a leadership quorum, so a follower refuses and points the client
+    /// at the leader instead. This is a deliberate loss of the M6 property
+    /// "get k on any node returns it" — follower reads via forwarding are a
+    /// §1.10 stretch goal, not something M7 claims.
+    #[tokio::test]
+    async fn a_follower_refuses_a_read_and_names_the_leader() {
+        let cluster = Cluster::of_three();
+        let leader = cluster.put(b"k", b"v").await;
+        cluster.settle(Duration::from_millis(300)).await;
+
+        for &id in ALL.iter().filter(|&&id| id != leader) {
             match cluster.get_from(id, b"k").await {
-                ClientReply::Value(Some(v)) => assert_eq!(v, b"v", "node {id}"),
-                other => panic!("node {id} answered {other:?}"),
+                ClientReply::NotLeader { hint } => {
+                    assert_eq!(hint, Some(leader), "node {id} should name the leader");
+                }
+                other => panic!("follower {id} served a read: {other:?}"),
             }
         }
     }

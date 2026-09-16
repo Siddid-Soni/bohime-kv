@@ -13,9 +13,9 @@
 //! crash produce a second vote in the same term, and election safety is gone.
 
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use kv_raft::{LogIndex, Message, NodeId, ProposeError, RaftNode, Role, Term};
+use kv_raft::{LogIndex, Message, NodeId, ProposeError, RaftNode, ReadIndexError, Role, Term};
 use kv_storage::Engine;
 use tokio::sync::{mpsc, oneshot};
 
@@ -53,6 +53,18 @@ struct Pending {
     /// write as a success, which is the worst bug available in this milestone.
     term: Term,
     reply: oneshot::Sender<ClientReply>,
+    deadline: Instant,
+}
+
+/// A client waiting on a linearizable read.
+struct PendingRead {
+    key: Vec<u8>,
+    reply: oneshot::Sender<ClientReply>,
+    deadline: Instant,
+    /// Set when ReadIndex confirms the leadership quorum. The read may then be
+    /// served as soon as the state machine has applied up to this index —
+    /// reading earlier would serve a value the confirmed index does not cover.
+    confirmed_at: Option<LogIndex>,
 }
 
 pub struct Driver {
@@ -64,6 +76,18 @@ pub struct Driver {
     peer_replies: mpsc::Receiver<(NodeId, Message)>,
     requests: mpsc::Receiver<ClientRequest>,
     pending: BTreeMap<LogIndex, Pending>,
+    pending_reads: BTreeMap<u64, PendingRead>,
+    next_token: u64,
+    /// What the *driver* has applied to the `Engine`. Deliberately not
+    /// `RaftNode`'s own count: the core considers an entry applied the moment
+    /// it hands it over in `Ready::committed`, and this is the only place that
+    /// knows it actually reached the state machine.
+    applied_index: LogIndex,
+    /// How long a client request may wait before the driver gives up on it. A
+    /// partitioned leader still believes it leads, so a read never confirms
+    /// and a write never commits — without a deadline both hang forever and
+    /// the client cannot tell that from slowness.
+    request_timeout: Duration,
     tick: Duration,
 }
 
@@ -85,6 +109,12 @@ impl Driver {
             peer_replies,
             requests,
             pending: BTreeMap::new(),
+            pending_reads: BTreeMap::new(),
+            next_token: 0,
+            applied_index: 0,
+            // Comfortably longer than an election, so an ordinary failover is
+            // ridden out rather than reported as a failure.
+            request_timeout: config.tick * (config.election_timeout as u32) * 6,
             tick: config.tick,
         }
     }
@@ -130,15 +160,13 @@ impl Driver {
 
     fn handle_request(&mut self, ClientRequest { op, reply }: ClientRequest) {
         let command = match op {
-            // The read is deliberately local and therefore deliberately
-            // **stale**: a deposed leader that has not yet heard about the
-            // election will happily serve its old value. That is expected at
-            // M6 — the gate is "get k on any node returns it" — and M7
-            // replaces it with ReadIndex. Do not mistake this for a finished
-            // path.
+            // Reads go through ReadIndex (§1.10), never straight to the
+            // engine. M6 read local state, which let a deposed leader serve a
+            // value that had already been overwritten — see
+            // `tests::linearizability`. Only the leader can serve a read, and
+            // only after a quorum confirms it still leads.
             ClientOp::Get { key } => {
-                let value = self.engine.get(&key).ok().flatten();
-                let _ = reply.send(ClientReply::Value(value));
+                self.begin_read(key, reply);
                 return;
             }
             ClientOp::Put { key, value } => Command::Put { key, value },
@@ -147,11 +175,84 @@ impl Driver {
 
         match self.node.propose(command.encode()) {
             Ok(index) => {
-                self.pending.insert(index, Pending { term: self.node.current_term(), reply });
+                self.pending.insert(
+                    index,
+                    Pending {
+                        term: self.node.current_term(),
+                        reply,
+                        deadline: Instant::now() + self.request_timeout,
+                    },
+                );
             }
             Err(ProposeError::NotLeader) => {
                 let _ = reply.send(ClientReply::NotLeader { hint: self.node.leader_id() });
             }
+        }
+    }
+
+    fn begin_read(&mut self, key: Vec<u8>, reply: oneshot::Sender<ClientReply>) {
+        self.next_token += 1;
+        let token = self.next_token;
+        match self.node.read_index(token) {
+            Ok(()) => {
+                self.pending_reads.insert(
+                    token,
+                    PendingRead {
+                        key,
+                        reply,
+                        deadline: Instant::now() + self.request_timeout,
+                        confirmed_at: None,
+                    },
+                );
+            }
+            // Either we do not lead, or we lead but have not yet committed an
+            // entry in our own term. Both mean "ask someone else", and the
+            // client's retry loop handles it.
+            Err(ReadIndexError::NotLeader | ReadIndexError::NoQuorumInTerm) => {
+                let _ = reply.send(ClientReply::NotLeader { hint: self.node.leader_id() });
+            }
+        }
+    }
+
+    /// Answers every read whose confirmed index the state machine has caught
+    /// up to.
+    fn serve_ready_reads(&mut self) {
+        let ready: Vec<u64> = self
+            .pending_reads
+            .iter()
+            .filter(|(_, r)| r.confirmed_at.is_some_and(|i| i <= self.applied_index))
+            .map(|(token, _)| *token)
+            .collect();
+
+        for token in ready {
+            let read = self.pending_reads.remove(&token).expect("just listed");
+            let value = self.engine.get(&read.key).ok().flatten();
+            let _ = read.reply.send(ClientReply::Value(value));
+        }
+    }
+
+    /// Gives up on requests that have waited too long.
+    ///
+    /// A partitioned leader still believes it leads: `propose` is accepted and
+    /// `read_index` starts a round, but neither can ever reach a quorum. The
+    /// node has no way to learn this — Raft leaders do not step down on their
+    /// own — so without a deadline the client waits forever.
+    fn expire_stale_requests(&mut self) {
+        let now = Instant::now();
+        let hint = self.node.leader_id();
+
+        let expired: Vec<LogIndex> =
+            self.pending.iter().filter(|(_, p)| p.deadline <= now).map(|(i, _)| *i).collect();
+        for index in expired {
+            let pending = self.pending.remove(&index).expect("just listed");
+            let _ = pending.reply.send(ClientReply::NotLeader { hint });
+        }
+
+        let expired: Vec<u64> =
+            self.pending_reads.iter().filter(|(_, r)| r.deadline <= now).map(|(t, _)| *t).collect();
+        for token in expired {
+            let read = self.pending_reads.remove(&token).expect("just listed");
+            let _ = read.reply.send(ClientReply::NotLeader { hint });
         }
     }
 
@@ -197,6 +298,7 @@ impl Driver {
         //    may hold nothing else until M8's snapshots persist an applied
         //    index.
         for entry in ready.committed {
+            let index = entry.index;
             match Command::decode(&entry.command) {
                 // The leader's no-op: committed and applied like any entry,
                 // and it means nothing to the state machine.
@@ -215,6 +317,10 @@ impl Driver {
                 }
             }
 
+            // Applied, for real, to the state machine. A confirmed read may
+            // not be served before this reaches its index.
+            self.applied_index = self.applied_index.max(index);
+
             if let Some(pending) = self.pending.remove(&entry.index) {
                 let reply = if pending.term == entry.term {
                     ClientReply::Applied
@@ -227,15 +333,32 @@ impl Driver {
             }
         }
 
-        // 5. If we are no longer the leader, nothing still pending will ever
-        //    commit under us. Answering now beats making the client wait out
-        //    its deadline.
-        if self.node.role() != Role::Leader && !self.pending.is_empty() {
+        // 5. Reads whose leadership quorum just came back.
+        for state in ready.read_states {
+            if let Some(read) = self.pending_reads.get_mut(&state.token) {
+                read.confirmed_at = Some(state.index);
+            }
+        }
+        self.serve_ready_reads();
+
+        // 6. If we are no longer the leader, nothing still pending will ever
+        //    commit or confirm under us. Answering now beats making the client
+        //    wait out its deadline.
+        if self.node.role() != Role::Leader
+            && !(self.pending.is_empty() && self.pending_reads.is_empty())
+        {
             let hint = self.node.leader_id();
             for (_, pending) in std::mem::take(&mut self.pending) {
                 let _ = pending.reply.send(ClientReply::NotLeader { hint });
             }
+            for (_, read) in std::mem::take(&mut self.pending_reads) {
+                let _ = read.reply.send(ClientReply::NotLeader { hint });
+            }
         }
+
+        // 7. And whatever has simply waited too long — a partitioned leader
+        //    never learns it was deposed, so nothing above will ever fire.
+        self.expire_stale_requests();
 
         Ok(())
     }

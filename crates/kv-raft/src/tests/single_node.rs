@@ -47,3 +47,21 @@ fn a_lone_leader_commits_and_applies_a_proposal() {
     let applied: Vec<_> = ready.committed.iter().map(|e| e.command.clone()).collect();
     assert_eq!(applied, vec![b"set x 1".to_vec()], "it must reach the state machine");
 }
+
+/// A group of one is its own read quorum. The same shape of bug as the commit
+/// rule had: confirmation only ran on receiving an AppendEntries ack, which a
+/// node with no peers never gets, so every read hung forever.
+#[test]
+fn a_lone_leader_confirms_a_read_immediately() {
+    let mut node = solo();
+    for _ in 0..25 {
+        node.tick();
+    }
+    let _ = node.ready();
+
+    node.read_index(7).expect("a lone caught-up leader can serve a read");
+    let ready = node.ready();
+    assert_eq!(ready.read_states.len(), 1, "no peer will ever ack; it must confirm itself");
+    assert_eq!(ready.read_states[0].token, 7);
+    assert_eq!(ready.read_states[0].index, node.commit_index());
+}

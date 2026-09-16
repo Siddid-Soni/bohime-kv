@@ -20,14 +20,14 @@ use crate::tests::cluster::{ALL, Cluster};
 /// overwritten *before* the read was issued. That is a linearizability
 /// violation, not a stale cache — the write of `v2` completed, and a read that
 /// began afterwards returned `v1`.
-/// Ignored only until ReadIndex lands, so the tree stays green between
-/// commits while the evidence stays in history. Against M6's local read it
-/// fails with:
+/// Against M6's local read this failed with:
 ///
 /// ```text
 /// stale read: node 3 served v1 after v2 was committed on 1
 /// ```
-#[ignore = "fails against M6's local read by design; unignored when ReadIndex lands"]
+///
+/// It passes now because the deposed leader can no longer confirm a read
+/// quorum, so it refuses instead of answering.
 #[tokio::test]
 async fn a_deposed_leader_must_not_serve_a_stale_read() {
     let cluster = Cluster::of_three();

@@ -31,11 +31,34 @@ fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
 }
 
-fn spawn_cluster(ports: &[u16]) -> Vec<Node> {
+/// The `kv-node` executable, rebuilt first.
+///
+/// **This rebuild is load-bearing.** `cargo nextest run` builds test binaries,
+/// not the crate's ordinary `[[bin]]` target, so `target/debug/kv-node` is
+/// whatever the last `cargo build` left there. Without this, the gate happily
+/// spawns a stale binary and passes — it did exactly that across the M7 read
+/// changes, reporting green while running M6 code, and only failed once the
+/// binary was rebuilt by hand. A test that can silently validate the wrong
+/// binary is worse than no test.
+///
+/// `cargo build` is a no-op in the common case. It is safe to call here
+/// because nextest has finished building and released the target lock before
+/// any test runs.
+fn kv_node_binary() -> std::path::PathBuf {
+    let status = Command::new(env!("CARGO"))
+        .args(["build", "--quiet", "-p", "kv-node", "--bin", "kv-node"])
+        .status()
+        .expect("cargo build runs");
+    assert!(status.success(), "kv-node failed to build; the gate cannot test a stale binary");
+
     // `CARGO_BIN_EXE_*` is set for integration tests only, and this is a unit
     // test inside the binary crate; `cargo_bin` resolves from the test
     // executable's own target directory instead.
-    let bin = assert_cmd::cargo::cargo_bin("kv-node");
+    assert_cmd::cargo::cargo_bin("kv-node")
+}
+
+fn spawn_cluster(ports: &[u16]) -> Vec<Node> {
+    let bin = kv_node_binary();
     ports
         .iter()
         .enumerate()
@@ -59,32 +82,33 @@ fn spawn_cluster(ports: &[u16]) -> Vec<Node> {
         .collect()
 }
 
-/// Polls one node until it serves `expected`, or fails after `within`.
+/// Polls the cluster until it serves `expected`, or fails after `within`.
 ///
-/// A follower learns the leader's `commit_index` on the *next* AppendEntries,
-/// so a read issued the instant the leader acks a write legitimately misses
-/// it. That lag is the M6 read semantics, not a bug — M7's ReadIndex is what
-/// removes it. What the gate asserts is that the write *arrives* everywhere,
-/// within a bound far wider than a heartbeat.
+/// Reads go through whichever node currently leads: since M7 a read takes a
+/// leadership quorum, so asking one node in particular is no longer
+/// meaningful, and the M6 property "get k on any node returns it" is
+/// deliberately gone — it was a property of the *stale* read.
+///
+/// Still a poll rather than a single call, because a freshly elected leader
+/// must commit its own no-op before it can serve any read at all.
 async fn read_until(
-    id: u64,
-    endpoint: &str,
+    cluster: &[(u64, String)],
     key: &[u8],
     expected: &[u8],
     within: Duration,
 ) -> Vec<u8> {
-    let mut client = Client::new(vec![(id, endpoint.to_string())]);
+    let mut client = Client::new(cluster.to_vec());
     let deadline = Instant::now() + within;
     let mut last = None;
     while Instant::now() < deadline {
-        last = client.get(key).await.expect("the node answers reads");
+        last = client.get(key).await.unwrap_or(None);
         if last.as_deref() == Some(expected) {
             return last.unwrap();
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     panic!(
-        "node {id} never served {:?} within {within:?}; last saw {last:?}",
+        "the cluster never served {:?} within {within:?}; last saw {last:?}",
         String::from_utf8_lossy(expected)
     );
 }
@@ -103,11 +127,8 @@ async fn three_processes_replicate_and_survive_killing_the_leader() {
     // successful put is also the signal that an election finished.
     client.put(b"alpha", b"one").await.expect("the cluster elects a leader and accepts a write");
 
-    // Every node serves the value: M6 reads are local, which is exactly what
-    // "get k on any node returns it" means.
-    for (id, endpoint) in endpoints(&ports) {
-        read_until(id, &endpoint, b"alpha", b"one", Duration::from_secs(10)).await;
-    }
+    // The write is readable back through the cluster.
+    read_until(&endpoints(&ports), b"alpha", b"one", Duration::from_secs(10)).await;
 
     let leader = client.leader().expect("the accepted write named a leader");
     let position = cluster.iter().position(|n| n.id == leader).expect("the leader is one of ours");
@@ -127,7 +148,5 @@ async fn three_processes_replicate_and_survive_killing_the_leader() {
 
     // And the survivors elect a new leader and keep taking writes.
     client.put(b"beta", b"two").await.expect("the survivors elect a new leader");
-    for (id, endpoint) in survivors {
-        read_until(id, &endpoint, b"beta", b"two", Duration::from_secs(10)).await;
-    }
+    read_until(&survivors, b"beta", b"two", Duration::from_secs(10)).await;
 }
