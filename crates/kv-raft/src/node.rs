@@ -20,6 +20,10 @@ pub struct RaftNode<S: RaftStorage> {
     role: Role,
     current_term: Term,
     voted_for: Option<NodeId>,
+    /// Who we currently believe leads this term, for `NotLeader` hints (M6).
+    /// Distinct from `voted_for`: that is who we voted for, who often lost.
+    /// A follower learns this only from an `AppendEntries` it accepts.
+    leader_id: Option<NodeId>,
     commit_index: LogIndex,
     last_applied: LogIndex,
     // BTreeSet, not HashSet: never iterated today, but M4's reproducibility
@@ -48,6 +52,7 @@ impl<S: RaftStorage> RaftNode<S> {
             role: Role::Follower,
             current_term: hs.term,
             voted_for: hs.voted_for,
+            leader_id: None,
             commit_index: hs.commit_index,
             last_applied: 0,
             votes_received: BTreeSet::new(),
@@ -72,6 +77,13 @@ impl<S: RaftStorage> RaftNode<S> {
 
     pub fn current_term(&self) -> Term {
         self.current_term
+    }
+
+    /// Who this node believes currently leads, for `NotLeader` hints (M6).
+    /// `None` on a fresh follower, during an election, and whenever a higher
+    /// term has made the last known leader stale.
+    pub fn leader_id(&self) -> Option<NodeId> {
+        self.leader_id
     }
 
     pub fn commit_index(&self) -> LogIndex {
@@ -160,6 +172,7 @@ impl<S: RaftStorage> RaftNode<S> {
                     if self.role != Role::Follower {
                         self.role = Role::Follower;
                     }
+                    self.leader_id = Some(leader_id);
                     self.reset_election_timer();
                     self.handle_append_entries(
                         leader_id,
@@ -238,6 +251,9 @@ impl<S: RaftStorage> RaftNode<S> {
         self.current_term = term;
         self.role = Role::Follower;
         self.voted_for = None;
+        // The leader we knew belonged to the old term; directing a client
+        // there now would send it to a deposed node.
+        self.leader_id = None;
         self.votes_received.clear();
         self.reset_election_timer();
         self.persist_hard_state();
@@ -254,6 +270,7 @@ impl<S: RaftStorage> RaftNode<S> {
         self.voted_for = Some(self.config.id);
         self.votes_received.clear();
         self.votes_received.insert(self.config.id);
+        self.leader_id = None;
         self.reset_election_timer();
         self.persist_hard_state();
 
@@ -275,6 +292,7 @@ impl<S: RaftStorage> RaftNode<S> {
 
     fn become_leader(&mut self) {
         self.role = Role::Leader;
+        self.leader_id = Some(self.config.id);
         let (last_index, _) = last_log(&self.storage);
         for peer in self.config.peers.clone() {
             self.next_index.insert(peer, last_index + 1);
