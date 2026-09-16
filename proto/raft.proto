@@ -43,8 +43,11 @@ message AppendEntriesResponse {
   bool success = 2;
   // Conflict hint fields (§1.5) so the leader can skip a whole term of
   // backtracking in one round trip instead of decrementing next_index by one.
-  uint64 conflict_term = 3;
-  uint64 conflict_index = 4;
+  // `optional` because kv-raft models these as Option<u64> and absence is
+  // meaningful: a sentinel 0 would be a lossy encoding, and a lossy conversion
+  // here produces bugs that look like Raft bugs.
+  optional uint64 conflict_term = 3;
+  optional uint64 conflict_index = 4;
   // Highest index the follower confirms matching, so the leader never infers
   // it from its own last send — see Message::AppendEntriesResp in kv-raft.
   uint64 match_index = 5;
@@ -62,4 +65,5 @@ message InstallSnapshotChunk {
 
 message InstallSnapshotResponse {
   uint64 term = 1;
+  bool success = 2;
 }
