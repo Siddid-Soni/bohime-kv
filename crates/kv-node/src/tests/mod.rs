@@ -1,3 +1,4 @@
+mod command;
 mod convert;
 mod storage;
 mod storage_equivalence;

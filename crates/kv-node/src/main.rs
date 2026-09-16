@@ -1,6 +1,7 @@
 //! `kv-node`: the impure shell binding kv-storage + kv-raft + kv-ring to
 //! real tokio/tonic I/O. Wiring begins at M6.
 
+mod command;
 mod storage;
 mod transport;
 
