@@ -90,6 +90,13 @@ impl<S: RaftStorage> RaftNode<S> {
         self.commit_index
     }
 
+    /// Borrow the storage, for a driver that must flush it before sending
+    /// (§1.5). Read-only on purpose: mutating the log behind the core's back
+    /// would desynchronise its `last_index`.
+    pub fn storage(&self) -> &S {
+        &self.storage
+    }
+
     pub fn match_index_of(&self, peer: NodeId) -> Option<LogIndex> {
         self.match_index.get(&peer).copied()
     }

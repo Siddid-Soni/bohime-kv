@@ -3,6 +3,7 @@
 
 mod command;
 mod config;
+mod driver;
 mod storage;
 mod transport;
 
