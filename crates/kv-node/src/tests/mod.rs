@@ -1,3 +1,5 @@
+pub(crate) mod cluster;
+
 mod command;
 mod config;
 mod convert;
