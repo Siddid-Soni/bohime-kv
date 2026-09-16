@@ -219,6 +219,9 @@ impl<S: RaftStorage> RaftNode<S> {
         for peer in self.config.peers.clone() {
             self.send_append(peer);
         }
+        // Same reason as `become_leader`: a group of one has already reached
+        // quorum the moment the entry is on its own disk.
+        self.try_advance_commit();
         Ok(index)
     }
 
@@ -308,6 +311,12 @@ impl<S: RaftStorage> RaftNode<S> {
             command: Vec::new(),
         }]);
         self.broadcast_heartbeats();
+        // A group of one is its own majority. Without this the lone leader
+        // appends its no-op and never commits it, because the only other path
+        // into the commit rule is an AppendEntries response that never
+        // arrives. For any cluster of three or more this is a no-op: `count`
+        // starts at 1 and quorum is 2+, so the rule's own guard declines.
+        self.try_advance_commit();
     }
 
     fn broadcast_heartbeats(&mut self) {

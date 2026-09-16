@@ -16,5 +16,6 @@ mod leader_hint;
 mod message;
 mod node_tick;
 mod request_vote;
+mod single_node;
 mod storage;
 mod types;
