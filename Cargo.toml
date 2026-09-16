@@ -12,6 +12,7 @@ kv-proto = { path = "crates/kv-proto" }
 kv-storage = { path = "crates/kv-storage" }
 kv-raft = { path = "crates/kv-raft" }
 kv-ring = { path = "crates/kv-ring" }
+kv-client = { path = "crates/kv-client" }
 kv-sim = { path = "crates/kv-sim" }
 
 tokio = { version = "1", features = ["full"] }

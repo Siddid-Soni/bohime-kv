@@ -12,6 +12,7 @@ kv-ring.workspace = true
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive"] }
 rand.workspace = true
+thiserror.workspace = true
 tokio = { workspace = true, features = ["full"] }
 tonic.workspace = true
 tracing.workspace = true

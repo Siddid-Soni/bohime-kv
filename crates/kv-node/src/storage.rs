@@ -12,7 +12,9 @@
 //! acknowledged.
 
 use std::cell::RefCell;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 
 use kv_raft::storage::RaftStorage;
 use kv_raft::types::{Entry, HardState, LogIndex, Snapshot, Term};
@@ -49,6 +51,9 @@ pub struct BitcaskStorage {
     // read methods take `&self`, hence interior mutability here rather than
     // `&mut` threaded through every M3 call site.
     engine: RefCell<Engine>,
+    /// Only read by the conformance harness, which reopens the same directory
+    /// to prove state survives a restart.
+    #[cfg(test)]
     path: PathBuf,
     last_index: LogIndex,
 }
@@ -61,9 +66,15 @@ impl BitcaskStorage {
             Some(bytes) => bincode::deserialize::<LogMeta>(&bytes)?.last_index,
             None => 0,
         };
-        Ok(Self { engine: RefCell::new(engine), path, last_index })
+        Ok(Self {
+            engine: RefCell::new(engine),
+            #[cfg(test)]
+            path,
+            last_index,
+        })
     }
 
+    #[cfg(test)]
     pub fn path(&self) -> &Path {
         &self.path
     }

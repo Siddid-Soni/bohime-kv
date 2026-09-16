@@ -164,11 +164,11 @@ impl Driver {
         //    AppendEntries, and each produces exactly one response addressed
         //    back to its sender, so taking the first such message is exact
         //    rather than a heuristic.
-        if let Some((from, channel)) = answer {
-            if let Some(i) = ready.messages.iter().position(|(to, _)| *to == from) {
-                let (_, msg) = ready.messages.remove(i);
-                let _ = channel.send(msg);
-            }
+        if let Some((from, channel)) = answer
+            && let Some(i) = ready.messages.iter().position(|(to, _)| *to == from)
+        {
+            let (_, msg) = ready.messages.remove(i);
+            let _ = channel.send(msg);
         }
 
         // 3. Everything else, shed on a full queue (M5's decision: Raft

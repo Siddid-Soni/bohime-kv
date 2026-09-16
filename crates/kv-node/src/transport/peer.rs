@@ -56,8 +56,12 @@ pub struct PeerClient {
     tx: mpsc::Sender<Message>,
     /// Connection attempts made. Exposed because "it backs off rather than
     /// spinning" is not observable without counting — a busy loop and a
-    /// correctly backing-off client look identical from the outside.
+    /// correctly backing-off client look identical from the outside. The
+    /// sender task keeps its own `Arc`; this copy exists only so M5's gate can
+    /// read it, hence `cfg(test)`.
+    #[cfg(test)]
     attempts: Arc<AtomicU64>,
+    #[cfg(test)]
     config: PeerConfig,
 }
 
@@ -76,7 +80,13 @@ impl PeerClient {
         let (tx, rx) = mpsc::channel(config.queue_depth);
         let attempts = Arc::new(AtomicU64::new(0));
         tokio::spawn(run(peer, addr, config, rx, replies, Arc::clone(&attempts)));
-        Self { tx, attempts, config }
+        Self {
+            tx,
+            #[cfg(test)]
+            attempts,
+            #[cfg(test)]
+            config,
+        }
     }
 
     /// Queues `msg`, shedding it if the queue is full. Never blocks.
@@ -88,10 +98,12 @@ impl PeerClient {
     }
 
     /// Messages waiting to be sent. Never exceeds `queue_depth`.
+    #[cfg(test)]
     pub fn queued(&self) -> usize {
         self.config.queue_depth - self.tx.capacity()
     }
 
+    #[cfg(test)]
     pub fn connect_attempts(&self) -> u64 {
         self.attempts.load(Ordering::Relaxed)
     }

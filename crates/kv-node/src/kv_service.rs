@@ -3,6 +3,11 @@
 //! driver is the only thing allowed to touch the Raft node or the state
 //! machine.
 
+// Every fallible call here returns `tonic::Status`, which is ~176 bytes and so
+// trips `result_large_err`. Boxing it would mean unwrapping at every tonic
+// boundary for no benefit; the transport and kv-proto carry the same allow.
+#![allow(clippy::result_large_err)]
+
 use kv_proto::kv as pb;
 use kv_proto::kv::kv_service_server::KvService;
 use tokio::sync::{mpsc, oneshot};

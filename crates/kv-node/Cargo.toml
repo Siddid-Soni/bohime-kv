@@ -31,6 +31,9 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 tonic-build.workspace = true
 
 [dev-dependencies]
+# Dev-only, and no cycle: kv-client depends on kv-proto and kv-ring alone.
+# M6's gate drives the real client against three real processes.
+kv-client.workspace = true
 assert_cmd.workspace = true
 criterion.workspace = true
 loom.workspace = true
