@@ -42,3 +42,17 @@ fn entries_are_readable_after_a_reopen_without_rewriting_hard_state() {
     assert_eq!(s.term(1).unwrap(), Some(3));
     assert_eq!(s.hard_state().unwrap(), HardState::default());
 }
+
+/// The driver calls this before every send (§1.5). It must be safe to call
+/// when nothing is pending, because most drains have nothing to persist.
+#[test]
+fn sync_is_callable_and_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = BitcaskStorage::open(dir.path()).unwrap();
+    s.append(&[kv_raft::Entry { term: 1, index: 1, command: b"x".to_vec() }]).unwrap();
+    s.sync().unwrap();
+    s.sync().unwrap();
+
+    let reopened = BitcaskStorage::open(dir.path()).unwrap();
+    assert_eq!(reopened.last_index().unwrap(), 1);
+}

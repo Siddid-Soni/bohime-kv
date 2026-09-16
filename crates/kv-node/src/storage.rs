@@ -68,6 +68,22 @@ impl BitcaskStorage {
         &self.path
     }
 
+    /// Flushes the Raft log to stable storage. The driver calls this after
+    /// draining a `Ready` and **before** sending anything (§1.5: disk before
+    /// network) — a vote must be durable before it is granted on the wire, or
+    /// a crash lets the node vote twice in one term and election safety is
+    /// gone.
+    ///
+    /// Redundant under the default `FsyncPolicy::EveryWrite`, where each write
+    /// has already synced on the way in, and a no-op when nothing is pending.
+    /// It is here so the ordering is explicit in the driver rather than an
+    /// accident of the policy: switching to `GroupCommit` for throughput must
+    /// not silently drop the guarantee.
+    pub fn sync(&self) -> Result<(), BitcaskStorageError> {
+        self.engine.borrow_mut().sync()?;
+        Ok(())
+    }
+
     fn put_meta(&self) -> Result<(), BitcaskStorageError> {
         let encoded = bincode::serialize(&LogMeta { last_index: self.last_index })?;
         self.engine.borrow_mut().put(LOG_META_KEY, &encoded)?;
