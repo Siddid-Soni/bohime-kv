@@ -104,6 +104,7 @@ async fn request_vote_and_append_entries_cross_a_real_socket() {
             prev_log_term: 0,
             entries: vec![kv_raft::Entry { term: 5, index: 1, command: b"x".to_vec() }],
             leader_commit: 0,
+            read_round: None,
         })
         .unwrap();
 

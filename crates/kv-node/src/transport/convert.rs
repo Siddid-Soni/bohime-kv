@@ -66,6 +66,7 @@ impl From<Message> for Outbound {
                 prev_log_term,
                 entries,
                 leader_commit,
+                read_round,
             } => Outbound::AppendEntries(pb::AppendEntriesRequest {
                 term,
                 leader_id,
@@ -73,6 +74,7 @@ impl From<Message> for Outbound {
                 prev_log_term,
                 entries: entries.into_iter().map(entry_to_pb).collect(),
                 leader_commit,
+                read_round,
             }),
             Message::AppendEntriesResp {
                 term,
@@ -80,12 +82,14 @@ impl From<Message> for Outbound {
                 match_index,
                 conflict_term,
                 conflict_index,
+                read_round,
             } => Outbound::AppendEntriesResp(pb::AppendEntriesResponse {
                 term,
                 success,
                 match_index,
                 conflict_term,
                 conflict_index,
+                read_round,
             }),
             Message::InstallSnapshot {
                 term,
@@ -134,6 +138,7 @@ impl TryFrom<Outbound> for Message {
                 prev_log_term: r.prev_log_term,
                 entries: r.entries.into_iter().map(entry_from_pb).collect(),
                 leader_commit: r.leader_commit,
+                read_round: r.read_round,
             },
             Outbound::AppendEntriesResp(r) => Message::AppendEntriesResp {
                 term: r.term,
@@ -141,6 +146,7 @@ impl TryFrom<Outbound> for Message {
                 match_index: r.match_index,
                 conflict_term: r.conflict_term,
                 conflict_index: r.conflict_index,
+                read_round: r.read_round,
             },
             Outbound::InstallSnapshot(r) => {
                 if r.offset != 0 || !r.done {

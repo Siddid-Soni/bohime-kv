@@ -36,6 +36,16 @@ message AppendEntriesRequest {
   uint64 prev_log_term = 4;
   repeated LogEntry entries = 5;
   uint64 leader_commit = 6;
+  // ReadIndex round (M7). A leader confirming that it still leads must count
+  // only acks to heartbeats it sent *after* the read was recorded; an ack
+  // already in flight proves leadership at some earlier instant, and the
+  // leader could have been deposed in between. The follower echoes this back
+  // untouched so the leader can tell the two apart.
+  //
+  // `optional` for the same reason the conflict hints are: absence is
+  // meaningful, and a sentinel 0 would make round 0 and "no round" the same
+  // value.
+  optional uint64 read_round = 7;
 }
 
 message AppendEntriesResponse {
@@ -51,6 +61,8 @@ message AppendEntriesResponse {
   // Highest index the follower confirms matching, so the leader never infers
   // it from its own last send — see Message::AppendEntriesResp in kv-raft.
   uint64 match_index = 5;
+  // Echoed from the request, untouched. See AppendEntriesRequest.read_round.
+  optional uint64 read_round = 6;
 }
 
 message InstallSnapshotChunk {

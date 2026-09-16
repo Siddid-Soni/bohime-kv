@@ -161,6 +161,7 @@ impl<S: RaftStorage> RaftNode<S> {
                 prev_log_term,
                 entries,
                 leader_commit,
+                read_round,
             } => {
                 if msg_term < self.current_term {
                     self.send(
@@ -171,6 +172,7 @@ impl<S: RaftStorage> RaftNode<S> {
                             match_index: 0,
                             conflict_term: None,
                             conflict_index: None,
+                            read_round,
                         },
                     );
                 } else {
@@ -187,6 +189,7 @@ impl<S: RaftStorage> RaftNode<S> {
                         prev_log_term,
                         entries,
                         leader_commit,
+                        read_round,
                     );
                 }
             }
@@ -196,6 +199,7 @@ impl<S: RaftStorage> RaftNode<S> {
                 match_index,
                 conflict_term,
                 conflict_index,
+                read_round,
             } => {
                 self.handle_append_entries_resp(
                     from,
@@ -204,6 +208,7 @@ impl<S: RaftStorage> RaftNode<S> {
                     match_index,
                     conflict_term,
                     conflict_index,
+                    read_round,
                 );
             }
             Message::InstallSnapshot { .. } | Message::InstallSnapshotResp { .. } => {
@@ -394,6 +399,7 @@ impl<S: RaftStorage> RaftNode<S> {
         prev_log_term: Term,
         entries: Vec<Entry>,
         leader_commit: LogIndex,
+        read_round: Option<u64>,
     ) {
         match check_consistency(&self.storage, prev_log_index, prev_log_term) {
             Consistency::Mismatch { conflict_term, conflict_index } => {
@@ -405,6 +411,7 @@ impl<S: RaftStorage> RaftNode<S> {
                         match_index: 0,
                         conflict_term,
                         conflict_index,
+                        read_round,
                     },
                 );
                 return;
@@ -453,6 +460,7 @@ impl<S: RaftStorage> RaftNode<S> {
                 success: true,
                 conflict_term: None,
                 conflict_index: None,
+                read_round,
             },
         );
     }
@@ -467,6 +475,7 @@ impl<S: RaftStorage> RaftNode<S> {
         reported_match: LogIndex,
         conflict_term: Option<Term>,
         conflict_index: Option<LogIndex>,
+        read_round: Option<u64>,
     ) {
         if self.role != Role::Leader || resp_term != self.current_term {
             return;
@@ -540,6 +549,7 @@ impl<S: RaftStorage> RaftNode<S> {
                 prev_log_term: prev_term,
                 entries,
                 leader_commit: self.commit_index,
+                read_round: None,
             },
         );
     }

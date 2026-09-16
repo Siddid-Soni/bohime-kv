@@ -18,6 +18,7 @@ fn append_from(leader: u64, term: u64) -> Message {
         prev_log_term: 0,
         entries: vec![],
         leader_commit: 0,
+        read_round: None,
     }
 }
 

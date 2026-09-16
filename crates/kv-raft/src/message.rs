@@ -65,6 +65,12 @@ pub enum Message {
         prev_log_term: Term,
         entries: Vec<Entry>,
         leader_commit: LogIndex,
+        /// ReadIndex round (M7), echoed back by the follower. A leader
+        /// confirming it still leads must count only acks to heartbeats sent
+        /// *after* the read was recorded — an ack already in flight proves
+        /// leadership at an earlier instant, and the leader could have been
+        /// deposed in between. `None` when no read is outstanding.
+        read_round: Option<u64>,
     },
     AppendEntriesResp {
         term: Term,
@@ -79,6 +85,8 @@ pub enum Message {
         match_index: LogIndex,
         conflict_term: Option<Term>,
         conflict_index: Option<LogIndex>,
+        /// Echoed from the request, untouched. See `AppendEntries::read_round`.
+        read_round: Option<u64>,
     },
     InstallSnapshot {
         term: Term,

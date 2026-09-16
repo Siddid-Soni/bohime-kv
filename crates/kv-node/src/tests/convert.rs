@@ -34,9 +34,18 @@ fn message_strategy() -> impl Strategy<Value = Message> {
             any::<u64>(),
             proptest::collection::vec(entry_strategy(), 0..6),
             any::<u64>(),
+            proptest::option::of(any::<u64>()),
         )
             .prop_map(
-                |(term, leader_id, prev_log_index, prev_log_term, entries, leader_commit)| {
+                |(
+                    term,
+                    leader_id,
+                    prev_log_index,
+                    prev_log_term,
+                    entries,
+                    leader_commit,
+                    read_round,
+                )| {
                     Message::AppendEntries {
                         term,
                         leader_id,
@@ -44,6 +53,7 @@ fn message_strategy() -> impl Strategy<Value = Message> {
                         prev_log_term,
                         entries,
                         leader_commit,
+                        read_round,
                     }
                 }
             ),
@@ -53,16 +63,20 @@ fn message_strategy() -> impl Strategy<Value = Message> {
             any::<u64>(),
             proptest::option::of(any::<u64>()),
             proptest::option::of(any::<u64>()),
+            proptest::option::of(any::<u64>()),
         )
-            .prop_map(|(term, success, match_index, conflict_term, conflict_index)| {
-                Message::AppendEntriesResp {
-                    term,
-                    success,
-                    match_index,
-                    conflict_term,
-                    conflict_index,
+            .prop_map(
+                |(term, success, match_index, conflict_term, conflict_index, read_round)| {
+                    Message::AppendEntriesResp {
+                        term,
+                        success,
+                        match_index,
+                        conflict_term,
+                        conflict_index,
+                        read_round,
+                    }
                 }
-            }),
+            ),
         (
             any::<u64>(),
             any::<u64>(),
@@ -95,6 +109,36 @@ proptest! {
     }
 }
 
+/// `read_round` is `Option<u64>` for the same reason the conflict hints are:
+/// round 0 is a real round, so a sentinel 0 would make "round 0" and "no read
+/// outstanding" the same value — and a leader would then count an ack from a
+/// heartbeat that carried no read at all as confirmation of one.
+#[test]
+fn an_absent_read_round_stays_absent() {
+    let none = Message::AppendEntriesResp {
+        term: 4,
+        success: true,
+        match_index: 2,
+        conflict_term: None,
+        conflict_index: None,
+        read_round: None,
+    };
+    let round_zero = Message::AppendEntriesResp {
+        term: 4,
+        success: true,
+        match_index: 2,
+        conflict_term: None,
+        conflict_index: None,
+        read_round: Some(0),
+    };
+
+    let back_none = Message::try_from(Outbound::from(none.clone())).unwrap();
+    let back_zero = Message::try_from(Outbound::from(round_zero.clone())).unwrap();
+    assert_eq!(back_none, none);
+    assert_eq!(back_zero, round_zero);
+    assert_ne!(back_none, back_zero, "round 0 and no round must not collapse");
+}
+
 #[test]
 fn absent_conflict_hints_stay_absent() {
     // The regression this guards: encoding Option<u64> as a sentinel 0 makes
@@ -106,6 +150,7 @@ fn absent_conflict_hints_stay_absent() {
         match_index: 0,
         conflict_term: None,
         conflict_index: None,
+        read_round: None,
     };
     let back = Message::try_from(Outbound::from(msg.clone())).unwrap();
     assert_eq!(back, msg);
@@ -116,6 +161,7 @@ fn absent_conflict_hints_stay_absent() {
         match_index: 0,
         conflict_term: Some(0),
         conflict_index: Some(0),
+        read_round: None,
     };
     let back_zero = Message::try_from(Outbound::from(with_zero.clone())).unwrap();
     assert_eq!(back_zero, with_zero);

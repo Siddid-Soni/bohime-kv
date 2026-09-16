@@ -17,6 +17,7 @@ fn every_message_variant_round_trips_through_bincode() {
             prev_log_term: 2,
             entries: vec![sample_entry()],
             leader_commit: 5,
+            read_round: None,
         },
         Message::AppendEntriesResp {
             term: 3,
@@ -24,6 +25,7 @@ fn every_message_variant_round_trips_through_bincode() {
             match_index: 0,
             conflict_term: Some(2),
             conflict_index: Some(4),
+            read_round: None,
         },
         Message::InstallSnapshot {
             term: 3,

@@ -65,6 +65,7 @@ fn heartbeat_suppresses_election_over_10k_ticks() {
                 prev_log_term: 0,
                 entries: vec![],
                 leader_commit: 0,
+                read_round: None,
             },
         );
         assert_eq!(node.role(), Role::Follower);

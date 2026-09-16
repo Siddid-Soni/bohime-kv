@@ -14,6 +14,7 @@ fn heartbeat(from: NodeId, to: NodeId) -> Envelope {
             prev_log_term: 0,
             entries: vec![],
             leader_commit: 0,
+            read_round: None,
         },
     }
 }

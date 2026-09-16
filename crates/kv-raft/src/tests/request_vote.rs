@@ -86,6 +86,7 @@ fn higher_term_steps_down_a_leader() {
             prev_log_term: 0,
             entries: vec![],
             leader_commit: 0,
+            read_round: None,
         },
     );
     assert_eq!(node.role(), Role::Follower);
