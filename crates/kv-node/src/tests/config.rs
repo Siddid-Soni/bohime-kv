@@ -47,16 +47,39 @@ fn the_heartbeat_is_well_inside_the_election_timeout() {
     assert!(c.heartbeat_interval * 3 <= c.election_timeout);
 }
 
-#[test]
-fn a_node_cannot_be_its_own_peer() {
-    let args = crate::config::Args {
-        id: 1,
+fn args(id: u64, peers: Vec<(u64, String)>) -> crate::config::Args {
+    crate::config::Args {
+        id,
         listen: "127.0.0.1:7001".parse().unwrap(),
-        peers: vec![(1, "http://127.0.0.1:7001".to_string())],
+        peers,
         data_dir: std::path::PathBuf::from("/tmp/n"),
         tick_ms: 20,
         election_timeout: 15,
         heartbeat_interval: 3,
-    };
-    assert!(args.into_config().is_err());
+    }
+}
+
+/// Every process in a cluster should be launchable with the same `--peer`
+/// flags, differing only in `--id` and `--listen`. So a node finding itself in
+/// its own list filters itself out rather than refusing to start.
+#[test]
+fn a_node_filters_itself_out_of_a_uniform_cluster_list() {
+    let uniform = vec![
+        (1, "http://127.0.0.1:7001".to_string()),
+        (2, "http://127.0.0.1:7002".to_string()),
+        (3, "http://127.0.0.1:7003".to_string()),
+    ];
+    let config = args(2, uniform).into_config().unwrap();
+    assert_eq!(config.peers.keys().copied().collect::<Vec<_>>(), vec![1, 3]);
+    assert_eq!(config.raft_config().cluster_size(), 3);
+}
+
+/// A duplicate is still a real mistake: it would leave the node believing the
+/// cluster is smaller than it is, and a quorum computed from a short list is
+/// not a quorum.
+#[test]
+fn a_repeated_peer_is_an_error() {
+    let repeated =
+        vec![(2, "http://127.0.0.1:7002".to_string()), (2, "http://127.0.0.1:9999".to_string())];
+    assert!(args(1, repeated).into_config().is_err());
 }

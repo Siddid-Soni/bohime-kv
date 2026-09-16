@@ -2,19 +2,45 @@
 
 A sharded, Raft-replicated key-value store in Rust, over gRPC.
 
-**Status: in progress (M2 of M13).** The Bitcask storage engine (record
-codec, append-only segments, crash-safe reopen via log replay, segment
-rotation, compaction with hint files, torn-tail truncation and a
-crash-safe compaction commit manifest, configurable fsync policy with group
-commit) and the Raft persistent-state layer (`RaftStorage` trait with
-in-memory and Bitcask-backed impls behind one conformance suite) are
-implemented and tested; the Raft core itself is next. Design and milestone
-sharding, and the gRPC layer are still ahead. Design and milestone plan live
-in `docs/DESIGN.md` — architecture is multi-Raft (consistent hashing over
-256 shards, each an independent from-scratch Raft group), storage is a
-from-scratch Bitcask-style log-structured engine, and correctness is checked
-with a deterministic simulator, property-based tests, and a linearizability
-checker under fault injection.
+**Status: in progress (M6 of M13).** The first end-to-end demo works: three
+processes form a Raft group, a client writes through the leader, every node
+serves the read, and `kill -9` on the leader loses nothing.
+
+Implemented and tested: the Bitcask storage engine (record codec, append-only
+segments, crash-safe reopen via log replay, segment rotation, compaction with
+hint files, torn-tail truncation, a crash-safe compaction commit manifest, and
+a configurable fsync policy with group commit); the Raft core as a pure state
+machine with no I/O, no async and no clock reads; a deterministic simulator
+that runs whole clusters under packet loss, partitions and crashes across
+100,000 seeds and reproduces any failure byte-for-byte from its seed; a gRPC
+transport with bounded queues, per-RPC deadlines and reconnect-with-backoff;
+and the node binary and client that turn all of it into a working key-value
+store.
+
+Ahead: linearizable reads and client sessions (M7), snapshots (M8), membership
+change (M9), then the sharding work — consistent hashing over 256 shards with
+one independent Raft group each (M10-M12).
+
+**Reads are deliberately stale until M7.** `Get` at M6 is served from local
+state, so a follower that has not yet applied the latest commit will answer
+with the previous value. That is visible from the CLI if you look for it, and
+M7's ReadIndex is what fixes it — the plan requires writing that test against
+this implementation first and watching it fail.
+
+### Try it
+
+```
+cargo build
+P="--peer 1=http://127.0.0.1:7521 --peer 2=http://127.0.0.1:7522 --peer 3=http://127.0.0.1:7523"
+for i in 1 2 3; do
+  ./target/debug/kv-node --id $i --listen 127.0.0.1:752$i $P --data-dir /tmp/bohime/n$i &
+done
+
+./target/debug/kv-client $P put greeting hello        # OK
+./target/debug/kv-client --peer 2=http://127.0.0.1:7522 get greeting   # hello
+```
+
+Every node takes the same `--peer` flags; only `--id` and `--listen` differ.
 
 This README will grow into the real project overview (architecture diagram,
 benchmark table, explicit non-goals) as milestones land — see M13.

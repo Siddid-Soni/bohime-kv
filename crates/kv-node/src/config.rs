@@ -59,7 +59,12 @@ pub struct Args {
     #[arg(long, default_value = "127.0.0.1:7001")]
     pub listen: SocketAddr,
 
-    /// A peer, as `id=endpoint`. Repeat once per peer.
+    /// A cluster member, as `id=endpoint`. Repeat once per member.
+    ///
+    /// This node may appear in its own list and is filtered out, so the same
+    /// `--peer` flags can be handed to every process in the cluster and only
+    /// `--id` and `--listen` differ. Rejecting self instead would make the
+    /// natural launch script an error.
     #[arg(long = "peer", value_parser = parse_peer)]
     pub peers: Vec<(NodeId, String)>,
 
@@ -90,8 +95,9 @@ impl Args {
     pub fn into_config(self) -> anyhow::Result<NodeConfig> {
         let mut peers = BTreeMap::new();
         for (id, addr) in self.peers {
+            // Ourselves: expected in a uniform cluster list, and not a peer.
             if id == self.id {
-                anyhow::bail!("node {id} cannot be its own peer");
+                continue;
             }
             if peers.insert(id, addr).is_some() {
                 anyhow::bail!("peer {id} given twice");
