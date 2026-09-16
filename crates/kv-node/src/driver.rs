@@ -110,10 +110,18 @@ impl Driver {
                 Some((peer, msg)) = self.peer_replies.recv() => {
                     self.node.step(peer, msg);
                 }
-                Some(request) = self.requests.recv() => {
-                    self.handle_request(request);
+                // The one arm that handles its own close. `select!` disables a
+                // `Some(..) =` arm whose channel has closed, and the `else`
+                // branch only fires when *every* arm is disabled — which the
+                // ticker never is. Without this the loop would outlive the
+                // process's last client handle and tick forever, holding both
+                // Bitcask directories open.
+                request = self.requests.recv() => {
+                    match request {
+                        Some(request) => self.handle_request(request),
+                        None => return Ok(()),
+                    }
                 }
-                else => return Ok(()),
             }
 
             self.drain(answer)?;
