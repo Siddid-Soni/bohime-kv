@@ -17,6 +17,6 @@ pub mod types;
 #[cfg(test)]
 mod tests;
 
-pub use message::{Action, Config, Message, ProposeError, ReadState, Ready, Role};
+pub use message::{Action, Config, Message, ProposeError, ReadIndexError, ReadState, Ready, Role};
 pub use node::RaftNode;
 pub use types::{Entry, HardState, LogIndex, NodeId, Snapshot, Term};

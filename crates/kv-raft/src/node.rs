@@ -10,10 +10,24 @@ use rand::{Rng, SeedableRng};
 
 use crate::election::{CandidateInfo, VoterState, should_grant_vote};
 use crate::log::{Consistency, check_consistency, last_log};
-use crate::message::{Action, Config, Message, ProposeError, Ready, Role};
+use crate::message::{
+    Action, Config, Message, ProposeError, ReadIndexError, ReadState, Ready, Role,
+};
 use crate::replication::backtrack;
 use crate::storage::RaftStorage;
 use crate::types::{Entry, HardState, LogIndex, NodeId, Term};
+
+/// The fields of an `AppendEntriesResp`, passed as one value rather than as
+/// seven positional arguments where transposing two of the `Option<u64>`s
+/// would compile and be wrong.
+struct AppendResponse {
+    term: Term,
+    success: bool,
+    match_index: LogIndex,
+    conflict_term: Option<Term>,
+    conflict_index: Option<LogIndex>,
+    read_round: Option<u64>,
+}
 
 pub struct RaftNode<S: RaftStorage> {
     config: Config,
@@ -34,6 +48,18 @@ pub struct RaftNode<S: RaftStorage> {
     heartbeat_elapsed: u64,
     next_index: BTreeMap<NodeId, LogIndex>,
     match_index: BTreeMap<NodeId, LogIndex>,
+    /// ReadIndex (M7), leader-only. `read_round` stamps outbound heartbeats so
+    /// an ack can be attributed to the round that carried it; `round_acks`
+    /// collects the peers that echoed the *current* round; `pending_reads`
+    /// holds `(token, index)` until a quorum confirms. All three are cleared
+    /// on any role change — evidence of leadership does not survive losing it.
+    read_round: u64,
+    round_acks: BTreeSet<NodeId>,
+    pending_reads: Vec<(u64, LogIndex)>,
+    /// Reads whose quorum has been confirmed, waiting to be drained by
+    /// `ready()`. Kept apart from the `Action` outbox because a read is not
+    /// work for the caller to perform — it is an answer.
+    confirmed_reads: Vec<ReadState>,
     /// Last log index covered by the most recent `AppendEntries` sent to each
     /// peer. Lets a success response advance `match_index` without changing
     /// the response shape (the leader knows what it sent).
@@ -61,6 +87,10 @@ impl<S: RaftStorage> RaftNode<S> {
             heartbeat_elapsed: 0,
             next_index: BTreeMap::new(),
             match_index: BTreeMap::new(),
+            read_round: 0,
+            round_acks: BTreeSet::new(),
+            pending_reads: Vec::new(),
+            confirmed_reads: Vec::new(),
             storage,
             rng,
             outbox: Vec::new(),
@@ -180,6 +210,7 @@ impl<S: RaftStorage> RaftNode<S> {
                     // follow it before touching the log.
                     if self.role != Role::Follower {
                         self.role = Role::Follower;
+                        self.abandon_reads();
                     }
                     self.leader_id = Some(leader_id);
                     self.reset_election_timer();
@@ -203,12 +234,14 @@ impl<S: RaftStorage> RaftNode<S> {
             } => {
                 self.handle_append_entries_resp(
                     from,
-                    resp_term,
-                    success,
-                    match_index,
-                    conflict_term,
-                    conflict_index,
-                    read_round,
+                    AppendResponse {
+                        term: resp_term,
+                        success,
+                        match_index,
+                        conflict_term,
+                        conflict_index,
+                        read_round,
+                    },
                 );
             }
             Message::InstallSnapshot { .. } | Message::InstallSnapshotResp { .. } => {
@@ -237,11 +270,43 @@ impl<S: RaftStorage> RaftNode<S> {
         Ok(index)
     }
 
+    /// Begins a linearizable read (M7, §1.10).
+    ///
+    /// Records the current commit index, then broadcasts a round-stamped
+    /// heartbeat to confirm this node still leads. When a quorum echoes that
+    /// round, the read surfaces in `Ready::read_states` and the caller may
+    /// serve it once it has applied up to that index. No disk write, one
+    /// network round trip — which is the entire point of ReadIndex over
+    /// pushing the read through the log.
+    ///
+    /// A read that is never confirmed never appears. The caller times it out;
+    /// the core has no clock.
+    pub fn read_index(&mut self, token: u64) -> Result<(), ReadIndexError> {
+        if self.role != Role::Leader {
+            return Err(ReadIndexError::NotLeader);
+        }
+        // §1.5's figure-8 rule in read form: a commit index still pointing
+        // into a previous term is not evidence this leader holds everything it
+        // must. The no-op appended on election is what clears this.
+        if self.storage.term(self.commit_index).expect("raft storage") != Some(self.current_term) {
+            return Err(ReadIndexError::NoQuorumInTerm);
+        }
+
+        self.pending_reads.push((token, self.commit_index));
+        // A fresh round, and no credit carried over from the last one: only
+        // acks to heartbeats sent from here on prove leadership *now*.
+        self.read_round += 1;
+        self.round_acks.clear();
+        self.broadcast_heartbeats();
+        Ok(())
+    }
+
     /// Drains everything pending into a `Ready`. Execution order for the
     /// caller: persist entries, persist hard state, send messages, apply
     /// committed — disk before network (§1.5).
     pub fn ready(&mut self) -> Ready {
-        let mut ready = Ready::default();
+        let mut ready =
+            Ready { read_states: std::mem::take(&mut self.confirmed_reads), ..Ready::default() };
         for action in self.outbox.drain(..) {
             match action {
                 Action::Send { to, msg } => ready.messages.push((to, msg)),
@@ -269,6 +334,7 @@ impl<S: RaftStorage> RaftNode<S> {
         // The leader we knew belonged to the old term; directing a client
         // there now would send it to a deposed node.
         self.leader_id = None;
+        self.abandon_reads();
         self.votes_received.clear();
         self.reset_election_timer();
         self.persist_hard_state();
@@ -286,6 +352,7 @@ impl<S: RaftStorage> RaftNode<S> {
         self.votes_received.clear();
         self.votes_received.insert(self.config.id);
         self.leader_id = None;
+        self.abandon_reads();
         self.reset_election_timer();
         self.persist_hard_state();
 
@@ -466,19 +533,35 @@ impl<S: RaftStorage> RaftNode<S> {
     }
 
     /// Leader-side bookkeeping: advance `match_index` on success, backtrack
-    /// and resend immediately on rejection.
-    fn handle_append_entries_resp(
-        &mut self,
-        from: NodeId,
-        resp_term: Term,
-        success: bool,
-        reported_match: LogIndex,
-        conflict_term: Option<Term>,
-        conflict_index: Option<LogIndex>,
-        read_round: Option<u64>,
-    ) {
+    /// and resend immediately on rejection, and count the ack toward any
+    /// outstanding ReadIndex round.
+    fn handle_append_entries_resp(&mut self, from: NodeId, resp: AppendResponse) {
+        let AppendResponse {
+            term: resp_term,
+            success,
+            match_index: reported_match,
+            conflict_term,
+            conflict_index,
+            read_round,
+        } = resp;
         if self.role != Role::Leader || resp_term != self.current_term {
             return;
+        }
+
+        // ReadIndex confirmation. Only an ack echoing the *current* round
+        // counts: one already in flight when the read arrived proves this node
+        // led at some earlier instant, and it could have been deposed in
+        // between. That is the stale read this whole mechanism removes, and it
+        // is visible only under a partition.
+        if read_round == Some(self.read_round) && !self.pending_reads.is_empty() {
+            self.round_acks.insert(from);
+            // +1 for the leader, which trivially holds its own log.
+            if self.round_acks.len() + 1 >= self.config.quorum() {
+                for (token, index) in self.pending_reads.drain(..) {
+                    self.confirmed_reads.push(ReadState { token, index });
+                }
+                self.round_acks.clear();
+            }
         }
         if success {
             // Monotonic: a delayed or duplicated reply to an older, shorter
@@ -549,9 +632,23 @@ impl<S: RaftStorage> RaftNode<S> {
                 prev_log_term: prev_term,
                 entries,
                 leader_commit: self.commit_index,
-                read_round: None,
+                // Stamped only while a read is outstanding: an unstamped ack
+                // must never be mistaken for confirmation of one.
+                read_round: if self.pending_reads.is_empty() {
+                    None
+                } else {
+                    Some(self.read_round)
+                },
             },
         );
+    }
+
+    /// Drops every outstanding read. Called on any loss of leadership: a
+    /// quorum ack confirms that we led when it was sent, which says nothing
+    /// once we no longer lead.
+    fn abandon_reads(&mut self) {
+        self.pending_reads.clear();
+        self.round_acks.clear();
     }
 
     fn send(&mut self, to: NodeId, msg: Message) {

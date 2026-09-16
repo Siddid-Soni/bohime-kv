@@ -125,7 +125,33 @@ pub enum Action {
     ApplyEntries { up_to: LogIndex },
 }
 
-/// A read that cleared the leadership check (M7). Always empty at M3.
+/// Why a leader cannot serve a read right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadIndexError {
+    /// Only the leader can serve a linearizable read. The caller answers
+    /// `NotLeader` and the client redirects.
+    NotLeader,
+    /// The leader has not yet committed an entry in its own term, so its
+    /// commit index may not reflect everything it is required to hold — the
+    /// figure-8 case. The no-op appended on election resolves this; until it
+    /// commits, reads must wait.
+    NoQuorumInTerm,
+}
+
+impl std::fmt::Display for ReadIndexError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReadIndexError::NotLeader => write!(f, "not the leader"),
+            ReadIndexError::NoQuorumInTerm => {
+                write!(f, "leader has not yet committed an entry in its own term")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReadIndexError {}
+
+/// A read that cleared the leadership check (M7).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadState {
     pub token: u64,

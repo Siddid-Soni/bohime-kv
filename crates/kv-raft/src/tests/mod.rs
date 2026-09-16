@@ -15,6 +15,7 @@ mod invariants;
 mod leader_hint;
 mod message;
 mod node_tick;
+mod read_index;
 mod request_vote;
 mod single_node;
 mod storage;

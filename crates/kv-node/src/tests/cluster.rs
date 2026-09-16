@@ -307,11 +307,10 @@ mod smoke {
         // the correct outcome here — what must never happen is `Applied`.
         for _ in 0..5 {
             let op = ClientOp::Put { key: b"k".to_vec(), value: b"never".to_vec() };
-            match cluster.try_call(old, op, Duration::from_millis(200)).await {
-                Some(ClientReply::Applied) => {
-                    panic!("an isolated node committed a write without a quorum")
-                }
-                Some(_) | None => {}
+            if let Some(ClientReply::Applied) =
+                cluster.try_call(old, op, Duration::from_millis(200)).await
+            {
+                panic!("an isolated node committed a write without a quorum");
             }
         }
     }
