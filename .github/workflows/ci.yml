@@ -4,6 +4,10 @@ on:
   push:
     branches: [master]
   pull_request:
+  schedule:
+    # Nightly, for the 100k-seed sweep — see the `sweep` job.
+    - cron: '0 3 * * *'
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -47,5 +51,32 @@ jobs:
             fi
           done
 
-      - name: seed sweeps (full gates)
-        run: cargo nextest run -p kv-sim --run-ignored all -E 'test(sweep_full)'
+      # The 10k-seed election gate is ~2s, so it runs on every push. The
+      # 100k-seed nemesis gate takes ~80 minutes and runs nightly instead —
+      # see the `sweep` job.
+      - name: election gate (10k seeds)
+        run: cargo nextest run -p kv-sim --run-ignored all -E 'test(election_sweep_full)'
+
+  # M4's full nemesis gate: 100k seeds, ~80 minutes. Far too slow to gate a
+  # push, but it is the milestone's headline claim and has caught real bugs,
+  # so it runs nightly and on demand rather than not at all.
+  sweep:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@cargo-nextest
+
+      - name: nemesis gate (100k seeds)
+        run: cargo nextest run --release -p kv-sim --run-ignored all -E 'test(nemesis_sweep_full)'
