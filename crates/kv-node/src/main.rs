@@ -2,6 +2,7 @@
 //! real tokio/tonic I/O. Wiring begins at M6.
 
 mod command;
+mod config;
 mod storage;
 mod transport;
 
