@@ -145,3 +145,48 @@ async fn a_follower_refuses_a_write_instead_of_applying_it() {
     let reply = call(&tx, ClientOp::Get { key: b"k".to_vec() }).await;
     assert!(matches!(reply, ClientReply::Value(None)), "a refused write must not land: {reply:?}");
 }
+
+#[tokio::test]
+async fn kv_service_puts_and_gets_over_a_real_socket() {
+    use kv_proto::kv::kv_service_client::KvServiceClient;
+    use kv_proto::kv::kv_service_server::KvServiceServer;
+    use kv_proto::kv::{GetRequest, PutRequest};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (tx, _keep) = spawn(&config(dir.path(), BTreeMap::new()));
+
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let service = crate::kv_service::KvApi::new(tx.clone());
+    let addr = format!("127.0.0.1:{port}").parse().unwrap();
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(KvServiceServer::new(service))
+            .serve(addr)
+            .await
+    });
+
+    let mut client = loop {
+        match KvServiceClient::connect(format!("http://127.0.0.1:{port}")).await {
+            Ok(c) => break c,
+            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    };
+
+    // Retrying through NotLeader, as a real client does: the lone node has to
+    // finish its election first.
+    for attempt in 0..200 {
+        let resp = client
+            .put(PutRequest { ctx: None, key: b"k".to_vec(), value: b"v".to_vec() })
+            .await
+            .unwrap()
+            .into_inner();
+        if resp.not_leader.is_none() {
+            break;
+        }
+        assert!(attempt < 199, "no leader emerged");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let resp = client.get(GetRequest { key: b"k".to_vec() }).await.unwrap().into_inner();
+    assert_eq!(resp.value, Some(b"v".to_vec()));
+}

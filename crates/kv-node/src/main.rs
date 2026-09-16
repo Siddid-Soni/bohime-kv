@@ -4,6 +4,7 @@
 mod command;
 mod config;
 mod driver;
+mod kv_service;
 mod storage;
 mod transport;
 
