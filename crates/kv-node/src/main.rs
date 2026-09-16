@@ -28,6 +28,7 @@ use crate::config::Args;
 use crate::driver::Driver;
 use crate::kv_service::KvApi;
 use crate::storage::BitcaskStorage;
+use crate::transport::PeerLink;
 use crate::transport::peer::{PeerClient, PeerConfig};
 use crate::transport::server::RaftServer;
 
@@ -55,10 +56,9 @@ async fn main() -> anyhow::Result<()> {
     // in any order.
     let mut peers = BTreeMap::new();
     for (&id, addr) in &config.peers {
-        peers.insert(
-            id,
-            PeerClient::connect(id, addr.clone(), PeerConfig::default(), replies_tx.clone()),
-        );
+        let client =
+            PeerClient::connect(id, addr.clone(), PeerConfig::default(), replies_tx.clone());
+        peers.insert(id, Box::new(client) as Box<dyn PeerLink>);
     }
 
     tracing::info!(

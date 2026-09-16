@@ -22,7 +22,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::command::Command;
 use crate::config::NodeConfig;
 use crate::storage::BitcaskStorage;
-use crate::transport::peer::PeerClient;
+use crate::transport::PeerLink;
 use crate::transport::server::Inbound;
 
 #[derive(Debug)]
@@ -59,7 +59,7 @@ pub struct Driver {
     node: RaftNode<BitcaskStorage>,
     /// The state machine: a second Bitcask instance, in its own directory.
     engine: Engine,
-    peers: BTreeMap<NodeId, PeerClient>,
+    peers: BTreeMap<NodeId, Box<dyn PeerLink>>,
     inbox: mpsc::Receiver<Inbound>,
     peer_replies: mpsc::Receiver<(NodeId, Message)>,
     requests: mpsc::Receiver<ClientRequest>,
@@ -72,7 +72,7 @@ impl Driver {
         config: &NodeConfig,
         node: RaftNode<BitcaskStorage>,
         engine: Engine,
-        peers: BTreeMap<NodeId, PeerClient>,
+        peers: BTreeMap<NodeId, Box<dyn PeerLink>>,
         inbox: mpsc::Receiver<Inbound>,
         peer_replies: mpsc::Receiver<(NodeId, Message)>,
         requests: mpsc::Receiver<ClientRequest>,
