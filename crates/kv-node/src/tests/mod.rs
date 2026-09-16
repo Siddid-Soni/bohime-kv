@@ -5,6 +5,7 @@ mod config;
 mod convert;
 mod driver;
 mod end_to_end;
+mod linearizability;
 mod storage;
 mod storage_equivalence;
 mod transport;
