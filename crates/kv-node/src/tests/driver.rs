@@ -77,7 +77,7 @@ async fn retrying(tx: &mpsc::Sender<ClientRequest>, op: impl Fn() -> ClientOp) -
 }
 
 async fn read(tx: &mpsc::Sender<ClientRequest>, key: &[u8]) -> ClientReply {
-    retrying(tx, || ClientOp::Get { key: key.to_vec() }).await
+    retrying(tx, || ClientOp::get(key)).await
 }
 
 #[tokio::test]
@@ -85,7 +85,7 @@ async fn a_put_is_committed_then_readable() {
     let dir = tempfile::tempdir().unwrap();
     let (tx, _keep) = spawn(&config(dir.path(), BTreeMap::new()));
 
-    let reply = retrying(&tx, || ClientOp::Put { key: b"k".to_vec(), value: b"v".to_vec() }).await;
+    let reply = retrying(&tx, || ClientOp::put(b"k", b"v")).await;
     assert!(matches!(reply, ClientReply::Applied), "got {reply:?}");
 
     let reply = read(&tx, b"k").await;
@@ -97,8 +97,8 @@ async fn a_delete_removes_the_key() {
     let dir = tempfile::tempdir().unwrap();
     let (tx, _keep) = spawn(&config(dir.path(), BTreeMap::new()));
 
-    retrying(&tx, || ClientOp::Put { key: b"k".to_vec(), value: b"v".to_vec() }).await;
-    let reply = retrying(&tx, || ClientOp::Delete { key: b"k".to_vec() }).await;
+    retrying(&tx, || ClientOp::put(b"k", b"v")).await;
+    let reply = retrying(&tx, || ClientOp::delete(b"k")).await;
     assert!(matches!(reply, ClientReply::Applied), "got {reply:?}");
 
     let reply = read(&tx, b"k").await;
@@ -122,8 +122,7 @@ async fn applied_writes_survive_a_restart() {
     let config = config(dir.path(), BTreeMap::new());
 
     let (first, keep) = spawn(&config);
-    let reply =
-        retrying(&first, || ClientOp::Put { key: b"k".to_vec(), value: b"v".to_vec() }).await;
+    let reply = retrying(&first, || ClientOp::put(b"k", b"v")).await;
     assert!(matches!(reply, ClientReply::Applied), "got {reply:?}");
     drop((first, keep));
     // Let the old driver observe its closed channels and release the Bitcask
@@ -146,14 +145,14 @@ async fn a_follower_refuses_a_write_instead_of_applying_it() {
         .collect();
     let (tx, _keep) = spawn(&config(dir.path(), peers));
 
-    let reply = call(&tx, ClientOp::Put { key: b"k".to_vec(), value: b"v".to_vec() }).await;
+    let reply = call(&tx, ClientOp::put(b"k", b"v")).await;
     assert!(matches!(reply, ClientReply::NotLeader { .. }), "got {reply:?}");
 
     // Since M7 it cannot serve the read either: a linearizable read needs a
     // leadership quorum, and this node has no peers that answer. Before M7 it
     // would have answered from local state, which is exactly the behaviour
     // `tests::linearizability` showed to be unsafe.
-    let reply = call(&tx, ClientOp::Get { key: b"k".to_vec() }).await;
+    let reply = call(&tx, ClientOp::get(b"k")).await;
     assert!(
         matches!(reply, ClientReply::NotLeader { .. }),
         "a node that cannot reach a quorum must not serve a read: {reply:?}"
@@ -203,4 +202,61 @@ async fn kv_service_puts_and_gets_over_a_real_socket() {
 
     let resp = client.get(GetRequest { key: b"k".to_vec() }).await.unwrap().into_inner();
     assert_eq!(resp.value, Some(b"v".to_vec()));
+}
+
+/// The session table shares a key space with user data under a reserved
+/// prefix, so a client must not be able to write there — forging a session
+/// entry would let it claim any request had already been answered.
+///
+/// Only reachable over gRPC: a NUL byte cannot survive `argv`, so the CLI can
+/// never produce such a key and cannot test this.
+#[tokio::test]
+async fn a_reserved_key_is_refused_at_the_service_boundary() {
+    use kv_proto::kv::kv_service_client::KvServiceClient;
+    use kv_proto::kv::kv_service_server::KvServiceServer;
+    use kv_proto::kv::{GetRequest, PutRequest};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (tx, _keep) = spawn(&config(dir.path(), BTreeMap::new()));
+
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let service = crate::kv_service::KvApi::new(tx.clone());
+    let addr = format!("127.0.0.1:{port}").parse().unwrap();
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(KvServiceServer::new(service))
+            .serve(addr)
+            .await
+    });
+
+    let mut client = loop {
+        match KvServiceClient::connect(format!("http://127.0.0.1:{port}")).await {
+            Ok(c) => break c,
+            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    };
+
+    let reserved = b"\x00session/forged".to_vec();
+    let err = client
+        .put(PutRequest { ctx: None, key: reserved.clone(), value: b"x".to_vec() })
+        .await
+        .expect_err("a reserved key must be refused");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument, "got {err:?}");
+
+    let err = client
+        .get(GetRequest { key: reserved })
+        .await
+        .expect_err("reading the reserved space is refused too");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument, "got {err:?}");
+
+    // An ordinary key with a zero byte later in it is fine — only the first
+    // byte is reserved, so binary keys still work.
+    // Accepted or redirected, but never rejected: that is what `expect`
+    // proves here. Whether this lone node has finished its election yet is
+    // beside the point.
+    let binary = b"bin\x00ary".to_vec();
+    client
+        .put(PutRequest { ctx: None, key: binary, value: b"ok".to_vec() })
+        .await
+        .expect("a zero byte elsewhere in the key is not reserved");
 }

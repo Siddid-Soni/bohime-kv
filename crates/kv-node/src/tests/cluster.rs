@@ -225,7 +225,7 @@ impl Cluster {
     }
 
     pub(crate) async fn get_from(&self, id: NodeId, key: &[u8]) -> ClientReply {
-        self.call(id, ClientOp::Get { key: key.to_vec() }).await
+        self.call(id, ClientOp::get(key)).await
     }
 
     /// Writes via whichever of `among` accepts, retrying through `NotLeader`.
@@ -233,7 +233,7 @@ impl Cluster {
     pub(crate) async fn put_among(&self, among: &[NodeId], key: &[u8], value: &[u8]) -> NodeId {
         for _ in 0..200 {
             for &id in among {
-                let op = ClientOp::Put { key: key.to_vec(), value: value.to_vec() };
+                let op = ClientOp::put(key, value);
                 if let ClientReply::Applied = self.call(id, op).await {
                     return id;
                 }
@@ -265,6 +265,20 @@ impl Cluster {
 
     pub(crate) async fn read(&self, key: &[u8]) -> Option<Vec<u8>> {
         self.read_among(&ALL, key).await
+    }
+
+    /// Which of `among` currently leads, found by asking each to serve a read:
+    /// since M7 only a leader that can confirm a quorum will.
+    pub(crate) async fn leader_of(&self, among: &[NodeId]) -> Option<NodeId> {
+        for _ in 0..200 {
+            for &id in among {
+                if let ClientReply::Value(_) = self.get_from(id, b"\x01probe").await {
+                    return Some(id);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        None
     }
 
     /// Real time passes here, so a wait is a real wait.
@@ -343,7 +357,7 @@ mod smoke {
         // entry waits forever. `try_call` returning `None` is that, and it is
         // the correct outcome here — what must never happen is `Applied`.
         for _ in 0..5 {
-            let op = ClientOp::Put { key: b"k".to_vec(), value: b"never".to_vec() };
+            let op = ClientOp::put(b"k", b"never");
             if let Some(ClientReply::Applied) =
                 cluster.try_call(old, op, Duration::from_millis(200)).await
             {

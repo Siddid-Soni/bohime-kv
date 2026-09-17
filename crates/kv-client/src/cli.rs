@@ -17,9 +17,25 @@ pub struct Args {
 
 #[derive(Debug, Subcommand)]
 pub enum CliCommand {
-    Get { key: String },
-    Put { key: String, value: String },
-    Delete { key: String },
+    Get {
+        key: String,
+    },
+    Put {
+        key: String,
+        value: String,
+    },
+    Delete {
+        key: String,
+    },
+    /// Compare-and-swap. Omit `--expected` to mean "only if absent".
+    Cas {
+        key: String,
+        new_value: String,
+        /// The value the key must currently hold. Absent means the key must
+        /// not exist — a distinct condition from holding an empty value.
+        #[arg(long)]
+        expected: Option<String>,
+    },
 }
 
 fn parse_peer(s: &str) -> Result<(NodeId, String), String> {
@@ -45,6 +61,17 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         CliCommand::Delete { key } => {
             client.delete(key.as_bytes()).await?;
             println!("OK");
+        }
+        CliCommand::Cas { key, new_value, expected } => {
+            let swapped = client
+                .cas(key.as_bytes(), expected.as_deref().map(str::as_bytes), new_value.as_bytes())
+                .await?;
+            if swapped {
+                println!("OK");
+            } else {
+                eprintln!("(not swapped)");
+                std::process::exit(1);
+            }
         }
     }
     Ok(())

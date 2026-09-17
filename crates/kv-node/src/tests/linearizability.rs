@@ -44,11 +44,7 @@ async fn a_deposed_leader_must_not_serve_a_stale_read() {
 
     // The deposed leader still thinks it leads and has heard nothing.
     let reply = cluster
-        .try_call(
-            old_leader,
-            crate::driver::ClientOp::Get { key: b"k".to_vec() },
-            Duration::from_secs(3),
-        )
+        .try_call(old_leader, crate::driver::ClientOp::get(b"k"), Duration::from_secs(3))
         .await;
 
     match reply {

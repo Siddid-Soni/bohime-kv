@@ -9,6 +9,7 @@ mod command;
 mod config;
 mod driver;
 mod kv_service;
+mod session;
 mod storage;
 mod transport;
 

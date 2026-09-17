@@ -19,24 +19,66 @@ use kv_raft::{LogIndex, Message, NodeId, ProposeError, RaftNode, ReadIndexError,
 use kv_storage::Engine;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::command::Command;
+use crate::command::{Command, Mutation};
 use crate::config::NodeConfig;
+use crate::session::{self, CommandResponse, RequestCtx};
 use crate::storage::BitcaskStorage;
 use crate::transport::PeerLink;
 use crate::transport::server::Inbound;
 
 #[derive(Debug)]
 pub enum ClientOp {
-    Get { key: Vec<u8> },
-    Put { key: Vec<u8>, value: Vec<u8> },
-    Delete { key: Vec<u8> },
+    Get {
+        key: Vec<u8>,
+    },
+    /// A mutation, with the context that makes a retry recognisable as the
+    /// same request. `ctx: None` opts out of retry tracking — legitimate for
+    /// `Put` and `Delete`, which are idempotent, and a mistake for `Cas`.
+    Mutate {
+        ctx: Option<RequestCtx>,
+        op: Mutation,
+    },
+}
+
+/// Convenience constructors for call sites that do not track retries.
+/// `cfg(test)` because only tests build a `ClientOp` by hand — the service
+/// always has a `ClientContext` from the request to pass through.
+#[cfg(test)]
+impl ClientOp {
+    pub fn put(key: &[u8], value: &[u8]) -> ClientOp {
+        ClientOp::Mutate {
+            ctx: None,
+            op: Mutation::Put { key: key.to_vec(), value: value.to_vec() },
+        }
+    }
+
+    pub fn delete(key: &[u8]) -> ClientOp {
+        ClientOp::Mutate { ctx: None, op: Mutation::Delete { key: key.to_vec() } }
+    }
+
+    pub fn get(key: &[u8]) -> ClientOp {
+        ClientOp::Get { key: key.to_vec() }
+    }
 }
 
 #[derive(Debug)]
 pub enum ClientReply {
     Value(Option<Vec<u8>>),
     Applied,
-    NotLeader { hint: Option<NodeId> },
+    /// Whether a compare-and-swap took effect.
+    Swapped(bool),
+    NotLeader {
+        hint: Option<NodeId>,
+    },
+}
+
+impl From<CommandResponse> for ClientReply {
+    fn from(response: CommandResponse) -> Self {
+        match response {
+            CommandResponse::Applied => ClientReply::Applied,
+            CommandResponse::Swapped(swapped) => ClientReply::Swapped(swapped),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -169,8 +211,7 @@ impl Driver {
                 self.begin_read(key, reply);
                 return;
             }
-            ClientOp::Put { key, value } => Command::Put { key, value },
-            ClientOp::Delete { key } => Command::Delete { key },
+            ClientOp::Mutate { ctx, op } => Command::new(ctx, op),
         };
 
         match self.node.propose(command.encode()) {
@@ -256,6 +297,50 @@ impl Driver {
         }
     }
 
+    /// Applies one committed command to the state machine, deduplicating
+    /// retries through the session table (§1.8).
+    ///
+    /// Every replica runs this over the same log in the same order, so the
+    /// session table is replicated like everything else — which is the point.
+    /// A table kept beside the state machine would die with the leader whose
+    /// death made it necessary.
+    fn apply(&mut self, command: Command) -> anyhow::Result<CommandResponse> {
+        // A retry of something already applied returns the answer that was
+        // given the first time. Re-evaluating would be wrong, not merely
+        // wasteful: a replayed `Cas` sees the value it already swapped in and
+        // answers `swapped: false`.
+        if let Some(ctx) = command.ctx
+            && let Some(cached) = session::cached(&mut self.engine, &ctx)?
+        {
+            return Ok(cached);
+        }
+
+        let response = match command.op {
+            Mutation::Put { key, value } => {
+                self.engine.put(&key, &value)?;
+                CommandResponse::Applied
+            }
+            Mutation::Delete { key } => {
+                self.engine.delete(&key)?;
+                CommandResponse::Applied
+            }
+            Mutation::Cas { key, expected, new_value } => {
+                let current = self.engine.get(&key)?;
+                if current == expected {
+                    self.engine.put(&key, &new_value)?;
+                    CommandResponse::Swapped(true)
+                } else {
+                    CommandResponse::Swapped(false)
+                }
+            }
+        };
+
+        if let Some(ctx) = command.ctx {
+            session::record(&mut self.engine, &ctx, &response)?;
+        }
+        Ok(response)
+    }
+
     /// Executes one `Ready`. See the module header for why the order is what
     /// it is.
     fn drain(&mut self, answer: Option<(NodeId, oneshot::Sender<Message>)>) -> anyhow::Result<()> {
@@ -299,35 +384,32 @@ impl Driver {
         //    index.
         for entry in ready.committed {
             let index = entry.index;
-            match Command::decode(&entry.command) {
+            let response = match Command::decode(&entry.command) {
                 // The leader's no-op: committed and applied like any entry,
                 // and it means nothing to the state machine.
-                Ok(None) => {}
-                Ok(Some(Command::Put { key, value })) => {
-                    self.engine.put(&key, &value)?;
-                }
-                Ok(Some(Command::Delete { key })) => {
-                    self.engine.delete(&key)?;
-                }
+                Ok(None) => None,
+                Ok(Some(command)) => Some(self.apply(command)?),
                 Err(e) => {
                     // A committed entry we cannot decode means the log and
                     // this binary disagree about the state machine. Applying
                     // past it would diverge the replicas silently.
                     anyhow::bail!("undecodable committed entry at index {}: {e}", entry.index);
                 }
-            }
+            };
 
             // Applied, for real, to the state machine. A confirmed read may
             // not be served before this reaches its index.
             self.applied_index = self.applied_index.max(index);
 
             if let Some(pending) = self.pending.remove(&entry.index) {
-                let reply = if pending.term == entry.term {
-                    ClientReply::Applied
-                } else {
+                let reply = match response {
                     // Our entry was overwritten by a later leader before it
                     // committed. The write did not happen.
-                    ClientReply::NotLeader { hint: self.node.leader_id() }
+                    _ if pending.term != entry.term => {
+                        ClientReply::NotLeader { hint: self.node.leader_id() }
+                    }
+                    Some(response) => response.into(),
+                    None => ClientReply::Applied,
                 };
                 let _ = pending.reply.send(reply);
             }

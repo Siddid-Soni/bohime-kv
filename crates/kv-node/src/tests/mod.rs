@@ -6,6 +6,7 @@ mod convert;
 mod driver;
 mod end_to_end;
 mod linearizability;
+mod session;
 mod storage;
 mod storage_equivalence;
 mod transport;

@@ -13,7 +13,9 @@ use kv_proto::kv::kv_service_server::KvService;
 use tokio::sync::{mpsc, oneshot};
 use tonic::{Request, Response, Status};
 
+use crate::command::Mutation;
 use crate::driver::{ClientOp, ClientReply, ClientRequest};
+use crate::session::{self, RequestCtx};
 
 pub struct KvApi {
     requests: mpsc::Sender<ClientRequest>,
@@ -39,6 +41,23 @@ impl KvApi {
 /// Node ids start at 1 throughout (`NodeConfig`), so 0 doubles as "this node
 /// knows of no leader either" — the client then scans instead of following a
 /// hint to nowhere.
+/// The session table lives in the same key space as user data, under a
+/// reserved prefix, so a client must not be able to write there. Rejected at
+/// the boundary rather than escaped, because escaping would change the
+/// on-disk layout of every existing key for a case no real client wants.
+fn check_key(key: &[u8]) -> Result<(), Status> {
+    if session::is_reserved(key) {
+        return Err(Status::invalid_argument("keys may not begin with a zero byte (reserved)"));
+    }
+    Ok(())
+}
+
+/// `None` when the client sent no context, meaning it is not tracking
+/// retries. Not a sentinel id: client 0 is a real client.
+fn ctx_from(ctx: Option<pb::ClientContext>) -> Option<RequestCtx> {
+    ctx.map(|c| RequestCtx { client_id: c.client_id, sequence: c.sequence_number })
+}
+
 fn not_leader(hint: Option<u64>) -> pb::NotLeader {
     pb::NotLeader { leader_hint: hint.unwrap_or(0) }
 }
@@ -55,7 +74,9 @@ impl KvService for KvApi {
         &self,
         request: Request<pb::GetRequest>,
     ) -> Result<Response<pb::GetResponse>, Status> {
-        match self.call(ClientOp::Get { key: request.into_inner().key }).await? {
+        let key = request.into_inner().key;
+        check_key(&key)?;
+        match self.call(ClientOp::Get { key }).await? {
             ClientReply::Value(value) => {
                 Ok(Response::new(pb::GetResponse { value, not_leader: None }))
             }
@@ -76,7 +97,9 @@ impl KvService for KvApi {
         request: Request<pb::PutRequest>,
     ) -> Result<Response<pb::PutResponse>, Status> {
         let req = request.into_inner();
-        match self.call(ClientOp::Put { key: req.key, value: req.value }).await? {
+        check_key(&req.key)?;
+        let op = Mutation::Put { key: req.key, value: req.value };
+        match self.call(ClientOp::Mutate { ctx: ctx_from(req.ctx), op }).await? {
             ClientReply::Applied => Ok(Response::new(pb::PutResponse { not_leader: None })),
             ClientReply::NotLeader { hint } => {
                 Ok(Response::new(pb::PutResponse { not_leader: Some(not_leader(hint)) }))
@@ -89,7 +112,10 @@ impl KvService for KvApi {
         &self,
         request: Request<pb::DeleteRequest>,
     ) -> Result<Response<pb::DeleteResponse>, Status> {
-        match self.call(ClientOp::Delete { key: request.into_inner().key }).await? {
+        let req = request.into_inner();
+        check_key(&req.key)?;
+        let op = Mutation::Delete { key: req.key };
+        match self.call(ClientOp::Mutate { ctx: ctx_from(req.ctx), op }).await? {
             ClientReply::Applied => Ok(Response::new(pb::DeleteResponse { not_leader: None })),
             ClientReply::NotLeader { hint } => {
                 Ok(Response::new(pb::DeleteResponse { not_leader: Some(not_leader(hint)) }))
@@ -98,13 +124,30 @@ impl KvService for KvApi {
         }
     }
 
-    /// Compare-and-swap needs the session table to stay idempotent under
-    /// retry, which is M7. Refused rather than half-implemented: a `Cas` that
-    /// double-applies on retry is worse than one that is absent.
+    /// Compare-and-swap, the operation that makes the session table earn its
+    /// keep. `expected: None` means "only if absent".
+    ///
+    /// A client that retries a `Cas` without a `ClientContext` gets a second
+    /// evaluation, and the second one sees the value the first swapped in — so
+    /// it answers `swapped: false` for an operation that did take effect. That
+    /// is a wrong answer, not a wasted write, which is why the context is what
+    /// makes retry safe here and merely tidy for `Put`.
     async fn cas(
         &self,
-        _request: Request<pb::CasRequest>,
+        request: Request<pb::CasRequest>,
     ) -> Result<Response<pb::CasResponse>, Status> {
-        Err(Status::unimplemented("Cas arrives at M7, with the session table"))
+        let req = request.into_inner();
+        check_key(&req.key)?;
+        let op = Mutation::Cas { key: req.key, expected: req.expected, new_value: req.new_value };
+        match self.call(ClientOp::Mutate { ctx: ctx_from(req.ctx), op }).await? {
+            ClientReply::Swapped(swapped) => {
+                Ok(Response::new(pb::CasResponse { swapped, not_leader: None }))
+            }
+            ClientReply::NotLeader { hint } => Ok(Response::new(pb::CasResponse {
+                swapped: false,
+                not_leader: Some(not_leader(hint)),
+            })),
+            other => Err(Status::internal(format!("driver answered a cas with {other:?}"))),
+        }
     }
 }

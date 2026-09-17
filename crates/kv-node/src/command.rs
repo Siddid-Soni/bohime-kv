@@ -1,4 +1,4 @@
-//! What a committed log entry means to the state machine (M6).
+//! What a committed log entry means to the state machine (M6, extended at M7).
 //!
 //! `Entry::command` is opaque to Raft by design, so the interpretation lives
 //! here. The one subtlety is the empty command: a new leader appends a no-op
@@ -9,13 +9,42 @@
 //! bincode tags an enum variant with a u32, so no real command can encode to
 //! zero bytes and collide with the no-op. There is a named test for that —
 //! the same collapse `Option<u64>` versus a sentinel 0 caused in M5's proto.
+//!
+//! M7 adds the request context. It rides in the log entry rather than beside
+//! it because the session table it feeds is part of the replicated state
+//! (§1.8) — a context that did not reach the log could not be replayed on the
+//! node that takes over.
 
 use serde::{Deserialize, Serialize};
 
+use crate::session::RequestCtx;
+
+/// A change to the state machine.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Command {
-    Put { key: Vec<u8>, value: Vec<u8> },
-    Delete { key: Vec<u8> },
+pub enum Mutation {
+    Put {
+        key: Vec<u8>,
+        value: Vec<u8>,
+    },
+    Delete {
+        key: Vec<u8>,
+    },
+    /// Compare-and-swap. `expected: None` means "only if absent", which is how
+    /// a create-if-not-exists is expressed without a separate operation.
+    Cas {
+        key: Vec<u8>,
+        expected: Option<Vec<u8>>,
+        new_value: Vec<u8>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Command {
+    /// `None` when the client is not tracking retries. Not a sentinel id:
+    /// client 0 is a real client, and conflating the two is the same trap a
+    /// sentinel `leader_hint` or `conflict_index` would be.
+    pub ctx: Option<RequestCtx>,
+    pub op: Mutation,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -25,6 +54,10 @@ pub enum CommandError {
 }
 
 impl Command {
+    pub fn new(ctx: Option<RequestCtx>, op: Mutation) -> Self {
+        Self { ctx, op }
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         bincode::serialize(self).expect("a Command always serializes")
     }
