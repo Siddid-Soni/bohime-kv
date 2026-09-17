@@ -23,6 +23,7 @@ fn config(dir: &std::path::Path, peers: BTreeMap<u64, String>) -> NodeConfig {
         tick: Duration::from_millis(5),
         election_timeout: 4,
         heartbeat_interval: 1,
+        lease_reads: false,
     };
     std::fs::create_dir_all(config.raft_dir()).unwrap();
     std::fs::create_dir_all(config.state_dir()).unwrap();

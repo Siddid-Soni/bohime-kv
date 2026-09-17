@@ -11,6 +11,7 @@ fn cfg(id: u64) -> NodeConfig {
         tick: Duration::from_millis(20),
         election_timeout: 15,
         heartbeat_interval: 3,
+        lease_reads: false,
     }
 }
 
@@ -56,6 +57,7 @@ fn args(id: u64, peers: Vec<(u64, String)>) -> crate::config::Args {
         tick_ms: 20,
         election_timeout: 15,
         heartbeat_interval: 3,
+        lease_reads: false,
     }
 }
 

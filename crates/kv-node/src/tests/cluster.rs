@@ -111,6 +111,12 @@ pub(crate) struct Cluster {
 
 impl Cluster {
     pub(crate) fn of_three() -> Cluster {
+        Cluster::of_three_with(false)
+    }
+
+    /// `lease_reads` opts the whole cluster into §1.10's lease reads, which
+    /// `tests::linearizability` uses to demonstrate what they cost.
+    pub(crate) fn of_three_with(lease_reads: bool) -> Cluster {
         let switchboard = Arc::new(Switchboard::default());
         let mut dirs = Vec::new();
         let mut configs = BTreeMap::new();
@@ -132,6 +138,7 @@ impl Cluster {
                 tick: Duration::from_millis(10),
                 election_timeout: 10,
                 heartbeat_interval: 2,
+                lease_reads,
             };
             std::fs::create_dir_all(config.raft_dir()).unwrap();
             std::fs::create_dir_all(config.state_dir()).unwrap();

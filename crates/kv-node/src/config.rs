@@ -19,6 +19,25 @@ pub struct NodeConfig {
     pub tick: Duration,
     pub election_timeout: u64,
     pub heartbeat_interval: u64,
+    /// Opt-in lease reads (§1.10). See `Args::lease_reads`.
+    pub lease_reads: bool,
+}
+
+impl NodeConfig {
+    /// How long a leadership lease is good for, once a quorum has acked.
+    ///
+    /// `election_timeout` minus a drift margin: no follower will start an
+    /// election before its own election timeout elapses, so within that window
+    /// nobody else can have become leader — **provided the clocks agree**.
+    /// The margin is what pays for them not quite agreeing, and it is why this
+    /// is off by default.
+    pub fn lease_duration(&self) -> Duration {
+        let full = self.tick * (self.election_timeout as u32);
+        // Two thirds: a blunt but honest drift allowance. A real deployment
+        // would derive it from a measured clock-drift bound, which is exactly
+        // the assumption ReadIndex does not make.
+        full * 2 / 3
+    }
 }
 
 impl NodeConfig {
@@ -83,6 +102,14 @@ pub struct Args {
     /// timeout, or a healthy leader is deposed between its own heartbeats.
     #[arg(long, default_value_t = 3)]
     pub heartbeat_interval: u64,
+
+    /// Serve reads from the leader's lease instead of confirming a quorum per
+    /// read (§1.10). Faster — zero round trips — but **correct only if clock
+    /// drift between nodes stays within the margin**, an assumption ReadIndex
+    /// does not make. Off by default, deliberately: the safe path is the one
+    /// you get without asking.
+    #[arg(long, default_value_t = false)]
+    pub lease_reads: bool,
 }
 
 fn parse_peer(s: &str) -> Result<(NodeId, String), String> {
@@ -111,6 +138,7 @@ impl Args {
             tick: Duration::from_millis(self.tick_ms),
             election_timeout: self.election_timeout,
             heartbeat_interval: self.heartbeat_interval,
+            lease_reads: self.lease_reads,
         })
     }
 }

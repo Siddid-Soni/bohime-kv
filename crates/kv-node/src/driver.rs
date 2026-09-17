@@ -130,6 +130,20 @@ pub struct Driver {
     /// and a write never commits — without a deadline both hang forever and
     /// the client cannot tell that from slowness.
     request_timeout: Duration,
+    /// §1.10's lease reads, off unless asked for. When on, a leader that has
+    /// recently had a quorum confirm it may serve reads with **no** round trip
+    /// at all — correct only while clock drift stays inside the margin, which
+    /// is the assumption ReadIndex does not make and the reason this is
+    /// opt-in.
+    lease_reads: bool,
+    lease_duration: Duration,
+    /// When the current lease lapses. Set every time a read quorum confirms,
+    /// which is the only evidence of leadership this process gets.
+    ///
+    /// Tracked here rather than in `kv-raft` because the core has no clock —
+    /// a lease is a wall-clock claim, and putting one in there would break the
+    /// purity M4's determinism rests on.
+    lease_until: Option<Instant>,
     tick: Duration,
 }
 
@@ -157,6 +171,9 @@ impl Driver {
             // Comfortably longer than an election, so an ordinary failover is
             // ridden out rather than reported as a failure.
             request_timeout: config.tick * (config.election_timeout as u32) * 6,
+            lease_reads: config.lease_reads,
+            lease_duration: config.lease_duration(),
+            lease_until: None,
             tick: config.tick,
         }
     }
@@ -232,6 +249,20 @@ impl Driver {
     }
 
     fn begin_read(&mut self, key: Vec<u8>, reply: oneshot::Sender<ClientReply>) {
+        // Lease read: a quorum confirmed our leadership recently enough that
+        // no other node can have become leader since — *if* the clocks agree.
+        // Zero round trips, and the whole correctness argument rests on that
+        // proviso, which is why it is off by default.
+        if self.lease_reads
+            && self.node.role() == Role::Leader
+            && self.lease_until.is_some_and(|until| Instant::now() < until)
+            && self.applied_index >= self.node.commit_index()
+        {
+            let value = self.engine.get(&key).ok().flatten();
+            let _ = reply.send(ClientReply::Value(value));
+            return;
+        }
+
         self.next_token += 1;
         let token = self.next_token;
         match self.node.read_index(token) {
@@ -415,7 +446,12 @@ impl Driver {
             }
         }
 
-        // 5. Reads whose leadership quorum just came back.
+        // 5. Reads whose leadership quorum just came back. A confirmation is
+        //    also the only evidence this process gets that it still leads, so
+        //    it is what renews the lease.
+        if !ready.read_states.is_empty() {
+            self.lease_until = Some(Instant::now() + self.lease_duration);
+        }
         for state in ready.read_states {
             if let Some(read) = self.pending_reads.get_mut(&state.token) {
                 read.confirmed_at = Some(state.index);
