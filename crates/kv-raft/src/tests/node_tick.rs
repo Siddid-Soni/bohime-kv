@@ -3,7 +3,14 @@ use crate::node::RaftNode;
 use crate::storage::MemStorage;
 
 fn config(id: u64, peers: Vec<u64>) -> Config {
-    Config { id, peers, election_timeout: 10, heartbeat_interval: 2, seed: 42 }
+    Config {
+        id,
+        peers,
+        election_timeout: 10,
+        heartbeat_interval: 2,
+        seed: 42,
+        initial_learner: false,
+    }
 }
 
 #[test]
@@ -101,8 +108,14 @@ fn leader_never_starts_an_election() {
 fn randomized_timeouts_differ_across_seeds() {
     let mut timeouts = std::collections::HashSet::new();
     for seed in 0..20 {
-        let cfg =
-            Config { id: 1, peers: vec![2, 3], election_timeout: 100, heartbeat_interval: 5, seed };
+        let cfg = Config {
+            id: 1,
+            peers: vec![2, 3],
+            election_timeout: 100,
+            heartbeat_interval: 5,
+            seed,
+            initial_learner: false,
+        };
         let mut node = RaftNode::new(cfg, MemStorage::default());
         let mut ticks = 0;
         while node.role() == Role::Follower {

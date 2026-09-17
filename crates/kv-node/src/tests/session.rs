@@ -96,6 +96,122 @@ async fn cas_declines_when_the_value_does_not_match() {
     assert_eq!(cluster.read(b"k").await, Some(b"actual".to_vec()), "it must not have written");
 }
 
+/// The table is bounded (M8): at most `cap` clients, LRU by applied index.
+/// Deterministic across replicas — recency is log order, never wall-clock —
+/// so every replica evicts the same client.
+#[test]
+fn client_count_is_bounded_by_lru_eviction() {
+    use crate::session::{CommandResponse, RequestCtx, cached, record_bounded};
+    use kv_storage::Engine;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::open(dir.path()).unwrap();
+    let cap = 4;
+    for client in 0..6 {
+        record_bounded(
+            &mut engine,
+            &RequestCtx { client_id: client, sequence: 1 },
+            &CommandResponse::Applied,
+            client + 1,
+            cap,
+        )
+        .unwrap();
+    }
+
+    // The two least recently touched are gone; the rest answer from cache.
+    for client in 0..2 {
+        assert!(
+            cached(&mut engine, &RequestCtx { client_id: client, sequence: 1 }).unwrap().is_none(),
+            "client {client} must have been evicted"
+        );
+    }
+    for client in 2..6 {
+        assert!(
+            cached(&mut engine, &RequestCtx { client_id: client, sequence: 1 }).unwrap().is_some(),
+            "client {client} must be retained"
+        );
+    }
+}
+
+/// Touching a client refreshes its recency: the eviction takes the idlest,
+/// not the oldest id.
+#[test]
+fn a_touch_refreshes_recency_against_eviction() {
+    use crate::session::{CommandResponse, RequestCtx, cached, record_bounded};
+    use kv_storage::Engine;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::open(dir.path()).unwrap();
+    let cap = 3;
+    for client in 0..3 {
+        record_bounded(
+            &mut engine,
+            &RequestCtx { client_id: client, sequence: 1 },
+            &CommandResponse::Applied,
+            client + 1,
+            cap,
+        )
+        .unwrap();
+    }
+    // Re-touch client 0 at a newer applied index, then overflow with client 3.
+    record_bounded(
+        &mut engine,
+        &RequestCtx { client_id: 0, sequence: 2 },
+        &CommandResponse::Applied,
+        10,
+        cap,
+    )
+    .unwrap();
+    record_bounded(
+        &mut engine,
+        &RequestCtx { client_id: 3, sequence: 1 },
+        &CommandResponse::Applied,
+        11,
+        cap,
+    )
+    .unwrap();
+
+    assert!(
+        cached(&mut engine, &RequestCtx { client_id: 0, sequence: 2 }).unwrap().is_some(),
+        "touched client 0 must survive"
+    );
+    assert!(
+        cached(&mut engine, &RequestCtx { client_id: 1, sequence: 1 }).unwrap().is_none(),
+        "idle client 1 must go first"
+    );
+}
+
+/// Entries written before M8's recency field existed still decode — with
+/// unknown age, so they are eviction-first rather than lost.
+#[test]
+fn entries_from_before_recency_tracking_still_decode() {
+    use crate::session::{CommandResponse, RequestCtx, cached};
+    use kv_storage::Engine;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::open(dir.path()).unwrap();
+    let mut key = vec![0x00];
+    key.extend_from_slice(b"session/");
+    key.extend_from_slice(&7u64.to_be_bytes());
+    let old = bincode::serialize(&OldSessionEntry {
+        last_sequence: 1,
+        last_response: CommandResponse::Applied,
+    })
+    .unwrap();
+    engine.put(&key, &old).unwrap();
+
+    assert_eq!(
+        cached(&mut engine, &RequestCtx { client_id: 7, sequence: 1 }).unwrap(),
+        Some(CommandResponse::Applied)
+    );
+}
+
+#[derive(serde::Serialize)]
+struct OldSessionEntry {
+    last_sequence: u64,
+    last_response: crate::session::CommandResponse,
+}
+
 /// The table is replicated state, so it survives the only event it exists for.
 /// A session kept beside the state machine would die with exactly the leader
 /// whose death made it necessary.

@@ -9,9 +9,61 @@ service RaftService {
   rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
   rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
   rpc InstallSnapshot(stream InstallSnapshotChunk) returns (InstallSnapshotResponse);
+  rpc TimeoutNow(TimeoutNowRequest) returns (TimeoutNowResponse);
+  // Every group's traffic to one peer, in one round trip (M11.3).
+  //
+  // The four RPCs above are one message per round trip, which caps a link at
+  // roughly one message per RTT. A node hosting a Raft group per shard has to
+  // heartbeat every one of them inside a single election timeout, so the
+  // per-peer sender coalesces whatever is queued into one of these instead.
+  // The unary RPCs stay: they are the same handlers with an arity of one, and
+  // InstallSnapshot cannot be batched at all since it is a stream.
+  rpc Batch(BatchRequest) returns (BatchResponse);
+}
+
+// One Raft message addressed to one group.
+//
+// The group is here rather than only inside the request because a *response*
+// carries none of its own — and a batch response has to say which group each
+// reply belongs to, or the caller cannot step it into the right log.
+message RaftEnvelope {
+  uint32 group = 1;
+  oneof msg {
+    RequestVoteRequest vote = 2;
+    RequestVoteResponse vote_resp = 3;
+    AppendEntriesRequest append = 4;
+    AppendEntriesResponse append_resp = 5;
+    TimeoutNowRequest timeout_now = 6;
+    TimeoutNowResponse timeout_now_resp = 7;
+  }
+}
+
+message BatchRequest {
+  repeated RaftEnvelope msgs = 1;
+}
+
+// One reply per envelope that could be delivered — fewer than the request
+// carried when a group has moved away or its inbox is full. Deliberately not
+// all-or-nothing: a batch that failed whole would make one absent shard cost
+// every other group in the same RPC its round trip.
+message BatchResponse {
+  repeated RaftEnvelope msgs = 1;
 }
 
 message RequestVoteRequest {
+  // Which Raft group on the target process this message is for (M10).
+  //
+  // A node hosts more than one group from M10 on — the meta group holding the
+  // shard map beside the data group(s) — and they share a process, a port and
+  // a peer address. Only this distinguishes them, and misrouting is not a
+  // dropped message but a message applied to the wrong log.
+  //
+  // 0 is reserved and always rejected: proto3 gives an absent field its zero
+  // value, so without a reserved value a sender that forgot to set the group
+  // would be indistinguishable from one that meant group 0, and the message
+  // would be delivered somewhere plausible instead of refused. Same reasoning
+  // as the `optional` conflict hints above.
+  uint32 group = 5;
   uint64 term = 1;
   uint64 candidate_id = 2;
   uint64 last_log_index = 3;
@@ -30,6 +82,8 @@ message LogEntry {
 }
 
 message AppendEntriesRequest {
+  // See RequestVoteRequest.group.
+  uint32 group = 8;
   uint64 term = 1;
   uint64 leader_id = 2;
   uint64 prev_log_index = 3;
@@ -66,6 +120,9 @@ message AppendEntriesResponse {
 }
 
 message InstallSnapshotChunk {
+  // See RequestVoteRequest.group. Repeated on every chunk, like the
+  // membership below, so each chunk stays self-describing.
+  uint32 group = 10;
   uint64 term = 1;
   uint64 leader_id = 2;
   uint64 last_included_index = 3;
@@ -73,9 +130,27 @@ message InstallSnapshotChunk {
   uint64 offset = 5;
   bytes data = 6;
   bool done = 7;
+  // Membership as of the boundary (M9): conf entries at or below it are gone
+  // with the prefix. Repeated on every chunk so each chunk is self-describing
+  // and the assembly check stays a pure uniformity comparison.
+  repeated uint64 voters = 8;
+  repeated uint64 learners = 9;
 }
 
 message InstallSnapshotResponse {
   uint64 term = 1;
   bool success = 2;
+}
+
+// Leadership handoff (M9): a leader that committed its own removal tells the
+// most-caught-up voter to campaign at once.
+message TimeoutNowRequest {
+  // See RequestVoteRequest.group.
+  uint32 group = 3;
+  uint64 term = 1;
+  uint64 leader_id = 2;
+}
+
+message TimeoutNowResponse {
+  uint64 term = 1;
 }

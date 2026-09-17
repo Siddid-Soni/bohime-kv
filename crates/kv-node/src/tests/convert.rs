@@ -92,11 +92,15 @@ fn message_strategy() -> impl Strategy<Value = Message> {
                         last_included_index,
                         last_included_term,
                         data,
+                        config: kv_raft::ClusterConfig::voting([leader_id]),
                     }
                 }
             ),
         (any::<u64>(), any::<bool>())
             .prop_map(|(term, success)| Message::InstallSnapshotResp { term, success }),
+        (any::<u64>(), any::<u64>())
+            .prop_map(|(term, leader_id)| Message::TimeoutNow { term, leader_id }),
+        (any::<u64>(),).prop_map(|(term,)| Message::TimeoutNowResp { term }),
     ]
 }
 
@@ -170,10 +174,11 @@ fn absent_conflict_hints_stay_absent() {
 
 #[test]
 fn a_partial_snapshot_chunk_is_rejected_not_silently_accepted() {
-    // Until M8 does real chunking, a fragment must be an error rather than be
-    // mistaken for a whole snapshot — which would install a truncated state
-    // machine and look like corruption.
+    // A fragment on its own is still meaningless: chunks are only valid as a
+    // stream the server assembles. Mistaking one for a whole snapshot would
+    // install a truncated state machine and look like corruption.
     let chunk = kv_proto::raft::InstallSnapshotChunk {
+        group: crate::transport::group::DATA,
         term: 3,
         leader_id: 1,
         last_included_index: 50,
@@ -181,9 +186,80 @@ fn a_partial_snapshot_chunk_is_rejected_not_silently_accepted() {
         offset: 4096,
         data: vec![7; 16],
         done: false,
+        voters: vec![1, 2],
+        learners: vec![],
     };
     assert_eq!(
         Message::try_from(Outbound::InstallSnapshot(chunk)),
         Err(ConvertError::ChunkedSnapshot { offset: 4096 })
     );
+}
+
+#[test]
+fn a_snapshot_chunks_and_reassembles_over_many_chunks() {
+    use crate::transport::convert::{SNAPSHOT_CHUNK_SIZE, assemble_snapshot, snapshot_chunks};
+
+    let msg = Message::InstallSnapshot {
+        term: 3,
+        leader_id: 1,
+        last_included_index: 50,
+        last_included_term: 2,
+        data: (0..(SNAPSHOT_CHUNK_SIZE * 2 + 100)).map(|i| (i % 251) as u8).collect(),
+        config: kv_raft::ClusterConfig::voting([1, 2]),
+    };
+    let chunks = snapshot_chunks(&msg);
+    assert!(chunks.len() >= 3, "a 2x-plus payload must split, got {}", chunks.len());
+    assert!(chunks.iter().all(|c| c.data.len() <= SNAPSHOT_CHUNK_SIZE));
+    assert_eq!(chunks.first().unwrap().offset, 0);
+    assert!(chunks.last().unwrap().done);
+    assert!(chunks[..chunks.len() - 1].iter().all(|c| !c.done));
+
+    let back = assemble_snapshot(&chunks).expect("chunks we produced must assemble");
+    assert_eq!(back, msg);
+}
+
+#[test]
+fn an_empty_snapshot_still_travels_as_one_chunk() {
+    use crate::transport::convert::{assemble_snapshot, snapshot_chunks};
+
+    let msg = Message::InstallSnapshot {
+        term: 1,
+        leader_id: 1,
+        last_included_index: 2,
+        last_included_term: 1,
+        data: Vec::new(),
+        config: kv_raft::ClusterConfig::voting([1, 2]),
+    };
+    let chunks = snapshot_chunks(&msg);
+    assert_eq!(chunks.len(), 1, "zero chunks would deliver nothing at all");
+    assert_eq!(assemble_snapshot(&chunks).unwrap(), msg);
+}
+
+#[test]
+fn assembly_rejects_a_gapped_mismatched_or_unterminated_stream() {
+    use crate::transport::convert::{assemble_snapshot, snapshot_chunks};
+
+    let msg = Message::InstallSnapshot {
+        term: 3,
+        leader_id: 1,
+        last_included_index: 50,
+        last_included_term: 2,
+        data: vec![7; 300_000],
+        config: kv_raft::ClusterConfig::voting([1, 2]),
+    };
+    let chunks = snapshot_chunks(&msg);
+
+    let mut gapped = chunks.clone();
+    gapped.remove(1);
+    assert!(assemble_snapshot(&gapped).is_err(), "a dropped chunk must not assemble");
+
+    let mut mismatched = chunks.clone();
+    mismatched[1].last_included_index = 51;
+    assert!(assemble_snapshot(&mismatched).is_err(), "a foreign chunk must not assemble");
+
+    let mut unterminated = chunks.clone();
+    unterminated.last_mut().unwrap().done = false;
+    assert!(assemble_snapshot(&unterminated).is_err(), "a stream with no end must not assemble");
+
+    assert!(assemble_snapshot(&[]).is_err(), "an empty stream carries no snapshot");
 }

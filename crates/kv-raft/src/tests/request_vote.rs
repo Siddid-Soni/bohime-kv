@@ -75,13 +75,18 @@ fn higher_term_steps_down_a_leader() {
     let leader_id = cluster.run_until_leader(500);
     let leader = cluster.nodes.iter().find(|n| n.id() == leader_id).unwrap();
     let term = leader.current_term();
+    // The higher term must arrive from a *member*: since M9, a message from a
+    // node outside the config is dropped before the term rules run, so a made-up
+    // sender id would assert nothing here. `stranger_messages_do_not_force_a_step_down`
+    // covers that case on purpose.
+    let usurper = cluster.nodes.iter().find(|n| n.id() != leader_id).unwrap().id();
 
     let node = cluster.nodes.iter_mut().find(|n| n.id() == leader_id).unwrap();
     node.step(
-        99,
+        usurper,
         Message::AppendEntries {
             term: term + 1,
-            leader_id: 99,
+            leader_id: usurper,
             prev_log_index: 0,
             prev_log_term: 0,
             entries: vec![],

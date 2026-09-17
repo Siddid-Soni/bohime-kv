@@ -6,6 +6,8 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+kv-raft.workspace = true
+thiserror.workspace = true
 serde = { workspace = true, features = ["derive"] }
 bincode.workspace = true
 # The shard map is published via ArcSwap, not left-right (see plan §1.15).

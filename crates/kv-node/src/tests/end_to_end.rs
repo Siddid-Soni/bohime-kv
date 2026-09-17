@@ -71,7 +71,14 @@ fn spawn_cluster(ports: &[u16]) -> Vec<Node> {
                 .arg("--listen")
                 .arg(format!("127.0.0.1:{port}"))
                 .arg("--data-dir")
-                .arg(dir.path());
+                .arg(dir.path())
+                // Four shards, not the default 256. The gate is about three
+                // real processes surviving a `kill -9`, not about how many
+                // Raft groups one box can tick: 256 shards × RF 3 is 768
+                // Bitcask pairs across three processes, which measures the
+                // machine rather than the code.
+                .arg("--shards")
+                .arg("4");
             for (j, &peer_port) in ports.iter().enumerate() {
                 if j != i {
                     cmd.arg("--peer").arg(format!("{}=http://127.0.0.1:{peer_port}", j + 1));

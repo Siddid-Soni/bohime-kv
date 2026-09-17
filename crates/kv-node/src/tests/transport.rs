@@ -12,6 +12,7 @@ use kv_raft::storage::MemStorage;
 use kv_raft::{Action, Config, Message, NodeId, RaftNode};
 use tokio::sync::mpsc;
 
+use crate::transport::group;
 use crate::transport::peer::{PeerClient, PeerConfig, SendError};
 use crate::transport::server::{Inbound, RaftServer};
 
@@ -21,7 +22,14 @@ fn free_port() -> u16 {
 }
 
 fn config(id: NodeId, peers: Vec<NodeId>) -> Config {
-    Config { id, peers, election_timeout: 10, heartbeat_interval: 2, seed: 7 }
+    Config {
+        id,
+        peers,
+        election_timeout: 10,
+        heartbeat_interval: 2,
+        seed: 7,
+        initial_learner: false,
+    }
 }
 
 /// Serves a `RaftServer` backed by a real node on `port`.
@@ -34,7 +42,7 @@ async fn serve(port: u16, node_id: NodeId, peers: Vec<NodeId>) -> mpsc::Receiver
 
     tokio::spawn(async move {
         let mut node = RaftNode::new(config(node_id, peers), MemStorage::default());
-        while let Some(Inbound { from, msg, reply }) = inbox_rx.recv().await {
+        while let Some(Inbound { from, msg, reply, .. }) = inbox_rx.recv().await {
             let _ = seen_tx.send(msg.clone()).await;
             let actions = node.step(from, msg);
             // The reply to a request is produced by the step that handled it,
@@ -74,12 +82,10 @@ async fn request_vote_and_append_entries_cross_a_real_socket() {
     );
 
     client
-        .try_send(Message::RequestVote {
-            term: 5,
-            candidate_id: 1,
-            last_log_index: 0,
-            last_log_term: 0,
-        })
+        .try_send(
+            group::DATA,
+            Message::RequestVote { term: 5, candidate_id: 1, last_log_index: 0, last_log_term: 0 },
+        )
         .unwrap();
 
     let received = tokio::time::timeout(Duration::from_secs(5), seen.recv())
@@ -92,20 +98,24 @@ async fn request_vote_and_append_entries_cross_a_real_socket() {
         .await
         .expect("the vote response should come back")
         .unwrap();
-    assert_eq!(reply.0, 2, "a reply is tagged with the peer we called");
+    assert_eq!(reply.0, group::DATA, "a reply is tagged with the group that asked");
+    assert_eq!(reply.1, 2, "a reply is tagged with the peer we called");
     // An empty log and a fresh term: the vote is granted.
-    assert!(matches!(reply.1, Message::RequestVoteResp { term: 5, vote_granted: true }));
+    assert!(matches!(reply.2, Message::RequestVoteResp { term: 5, vote_granted: true }));
 
     client
-        .try_send(Message::AppendEntries {
-            term: 5,
-            leader_id: 1,
-            prev_log_index: 0,
-            prev_log_term: 0,
-            entries: vec![kv_raft::Entry { term: 5, index: 1, command: b"x".to_vec() }],
-            leader_commit: 0,
-            read_round: None,
-        })
+        .try_send(
+            group::DATA,
+            Message::AppendEntries {
+                term: 5,
+                leader_id: 1,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![kv_raft::Entry { term: 5, index: 1, command: b"x".to_vec() }],
+                leader_commit: 0,
+                read_round: None,
+            },
+        )
         .unwrap();
 
     let received = tokio::time::timeout(Duration::from_secs(5), seen.recv())
@@ -124,7 +134,62 @@ async fn request_vote_and_append_entries_cross_a_real_socket() {
         .await
         .expect("the append response should come back")
         .unwrap();
-    assert!(matches!(reply.1, Message::AppendEntriesResp { success: true, match_index: 1, .. }));
+    assert!(matches!(reply.2, Message::AppendEntriesResp { success: true, match_index: 1, .. }));
+}
+
+/// A snapshot crosses as a chunk stream and installs on arrival: the server
+/// reassembles the chunks into the whole message, steps a real node with it,
+/// and the success response travels back. Sized past two chunk boundaries so a
+/// single-chunk fast path cannot pass this.
+#[tokio::test]
+async fn a_snapshot_crosses_a_real_socket_in_chunks_and_installs() {
+    use crate::transport::convert::SNAPSHOT_CHUNK_SIZE;
+
+    let port = free_port();
+    let mut seen = serve(port, 2, vec![1]).await;
+
+    let (replies_tx, mut replies) = mpsc::channel(32);
+    let client = PeerClient::connect(
+        2,
+        format!("http://127.0.0.1:{port}"),
+        PeerConfig::default(),
+        replies_tx,
+    );
+
+    let data: Vec<u8> = (0..(SNAPSHOT_CHUNK_SIZE * 2 + 100)).map(|i| (i % 251) as u8).collect();
+    client
+        .try_send(
+            group::DATA,
+            Message::InstallSnapshot {
+                term: 5,
+                leader_id: 1,
+                last_included_index: 9,
+                last_included_term: 4,
+                data: data.clone(),
+                config: kv_raft::ClusterConfig::voting([1, 2]),
+            },
+        )
+        .unwrap();
+
+    let received = tokio::time::timeout(Duration::from_secs(10), seen.recv())
+        .await
+        .expect("the server should receive the reassembled snapshot")
+        .unwrap();
+    match received {
+        Message::InstallSnapshot { last_included_index, data: arrived, .. } => {
+            assert_eq!(last_included_index, 9);
+            assert_eq!(arrived, data, "every chunk's bytes must arrive exactly once, in order");
+        }
+        other => panic!("expected InstallSnapshot, got {other:?}"),
+    }
+
+    let reply = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+        .await
+        .expect("the install response should come back")
+        .unwrap();
+    // A fresh node has committed nothing, so index 9 is newer than everything
+    // it holds: it installs and says so.
+    assert!(matches!(reply.2, Message::InstallSnapshotResp { success: true, .. }));
 }
 
 #[tokio::test]
@@ -138,6 +203,9 @@ async fn a_dead_peer_backs_off_instead_of_spinning() {
         PeerConfig {
             queue_depth: 256,
             request_timeout: Duration::from_millis(50),
+            snapshot_timeout: Duration::from_secs(30),
+            max_batch: 256,
+            max_snapshots_inflight: 2,
             backoff_initial: Duration::from_millis(50),
             backoff_max: Duration::from_secs(5),
         },
@@ -147,7 +215,8 @@ async fn a_dead_peer_backs_off_instead_of_spinning() {
     // Keep the queue fed so the sender task always has work; a client that
     // spins would burn through attempts as fast as it can dial.
     for _ in 0..200 {
-        let _ = client.try_send(Message::RequestVoteResp { term: 1, vote_granted: false });
+        let _ =
+            client.try_send(group::DATA, Message::RequestVoteResp { term: 1, vote_granted: false });
     }
     tokio::time::sleep(Duration::from_millis(1200)).await;
 
@@ -172,6 +241,9 @@ async fn a_full_queue_sheds_instead_of_growing() {
         PeerConfig {
             queue_depth: depth,
             request_timeout: Duration::from_millis(50),
+            snapshot_timeout: Duration::from_secs(30),
+            max_batch: 256,
+            max_snapshots_inflight: 2,
             backoff_initial: Duration::from_secs(30),
             backoff_max: Duration::from_secs(30),
         },
@@ -180,7 +252,7 @@ async fn a_full_queue_sheds_instead_of_growing() {
 
     let mut shed = 0;
     for _ in 0..500 {
-        if client.try_send(Message::RequestVoteResp { term: 1, vote_granted: false })
+        if client.try_send(group::DATA, Message::RequestVoteResp { term: 1, vote_granted: false })
             == Err(SendError::Full)
         {
             shed += 1;

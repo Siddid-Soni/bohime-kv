@@ -12,15 +12,21 @@ fn cfg(id: u64) -> NodeConfig {
         election_timeout: 15,
         heartbeat_interval: 3,
         lease_reads: false,
+        keydir: Default::default(),
+        snapshot_threshold: 10_000,
+        initial_learner: false,
+        num_shards: 256,
+        replication_factor: 3,
+        vnodes_per_node: kv_ring::DEFAULT_VNODES,
     }
 }
 
 #[test]
 fn the_raft_log_and_the_state_machine_get_separate_directories() {
     let c = cfg(1);
-    assert_ne!(c.raft_dir(), c.state_dir(), "one Bitcask directory cannot hold both");
-    assert!(c.raft_dir().starts_with(&c.data_dir));
-    assert!(c.state_dir().starts_with(&c.data_dir));
+    assert_ne!(c.shard_raft_dir(0), c.shard_state_dir(0), "one Bitcask directory cannot hold both");
+    assert!(c.shard_raft_dir(0).starts_with(&c.data_dir));
+    assert!(c.shard_state_dir(0).starts_with(&c.data_dir));
 }
 
 /// Identical seeds make every node draw the identical election timeout, so
@@ -58,6 +64,12 @@ fn args(id: u64, peers: Vec<(u64, String)>) -> crate::config::Args {
         election_timeout: 15,
         heartbeat_interval: 3,
         lease_reads: false,
+        keydir: Default::default(),
+        snapshot_threshold: 10_000,
+        join: false,
+        num_shards: 256,
+        replication_factor: 1,
+        vnodes_per_node: kv_ring::DEFAULT_VNODES,
     }
 }
 

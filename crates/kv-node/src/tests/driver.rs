@@ -11,8 +11,9 @@ use kv_storage::Engine;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::NodeConfig;
-use crate::driver::{ClientOp, ClientReply, ClientRequest, Driver};
+use crate::driver::{ClientOp, ClientReply, ClientRequest, Driver, Group, GroupChannels};
 use crate::storage::BitcaskStorage;
+use crate::tests::support::SilentPeers;
 
 fn config(dir: &std::path::Path, peers: BTreeMap<u64, String>) -> NodeConfig {
     let config = NodeConfig {
@@ -24,9 +25,15 @@ fn config(dir: &std::path::Path, peers: BTreeMap<u64, String>) -> NodeConfig {
         election_timeout: 4,
         heartbeat_interval: 1,
         lease_reads: false,
+        keydir: Default::default(),
+        snapshot_threshold: 10_000,
+        initial_learner: false,
+        num_shards: 256,
+        replication_factor: 3,
+        vnodes_per_node: kv_ring::DEFAULT_VNODES,
     };
-    std::fs::create_dir_all(config.raft_dir()).unwrap();
-    std::fs::create_dir_all(config.state_dir()).unwrap();
+    std::fs::create_dir_all(config.shard_raft_dir(0)).unwrap();
+    std::fs::create_dir_all(config.shard_state_dir(0)).unwrap();
     config
 }
 
@@ -34,24 +41,34 @@ fn config(dir: &std::path::Path, peers: BTreeMap<u64, String>) -> NodeConfig {
 /// senders are returned too: dropping them would close those `select!` arms
 /// and shut the loop down mid-test.
 fn spawn(config: &NodeConfig) -> (mpsc::Sender<ClientRequest>, Box<dyn std::any::Any + Send>) {
-    let node =
-        RaftNode::new(config.raft_config(), BitcaskStorage::open(config.raft_dir()).unwrap());
-    let engine = Engine::open(config.state_dir()).unwrap();
+    let node = RaftNode::new(
+        config.raft_config(),
+        BitcaskStorage::open(config.shard_raft_dir(0)).unwrap(),
+    );
+    let engine = Engine::open(config.shard_state_dir(0)).unwrap();
 
     let (inbox_tx, inbox) = mpsc::channel(8);
     let (replies_tx, replies) = mpsc::channel(8);
     let (requests, requests_rx) = mpsc::channel(8);
+    let (admin_tx, admin) = mpsc::channel(8);
 
-    let driver = Driver::new(config, node, engine, BTreeMap::new(), inbox, replies, requests_rx);
+    let (groups_tx, new_groups) = mpsc::channel(8);
+    let driver = Driver::new(
+        config,
+        vec![Group::new(config, crate::transport::group::DATA, node, engine)],
+        BTreeMap::new(),
+        Box::new(SilentPeers),
+        GroupChannels { inbox, peer_replies: replies, requests: requests_rx, admin, new_groups },
+    );
     tokio::spawn(driver.run());
-    (requests, Box::new((inbox_tx, replies_tx)))
+    (requests, Box::new((inbox_tx, replies_tx, admin_tx, groups_tx)))
 }
 
 /// One request, one answer, no retry. Used where the refusal *is* the
 /// assertion.
 async fn call(tx: &mpsc::Sender<ClientRequest>, op: ClientOp) -> ClientReply {
     let (reply, wait) = oneshot::channel();
-    tx.send(ClientRequest { op, reply }).await.unwrap();
+    tx.send(ClientRequest { group: crate::transport::group::DATA, op, reply }).await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), wait)
         .await
         .expect("the driver answers")
@@ -135,6 +152,66 @@ async fn applied_writes_survive_a_restart() {
     assert!(matches!(reply, ClientReply::Value(Some(ref v)) if v == b"v"), "got {reply:?}");
 }
 
+/// Snapshots are taken from live state once the log past them is long enough:
+/// the prefix is dropped from the Raft log and reads keep serving from the
+/// same state.
+#[tokio::test]
+async fn a_snapshot_is_taken_and_the_log_prefix_is_dropped() {
+    use kv_raft::storage::RaftStorage;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config(dir.path(), BTreeMap::new());
+    cfg.snapshot_threshold = 3;
+    let (tx, _keep) = spawn(&cfg);
+
+    for i in 0..4 {
+        let reply = retrying(&tx, || ClientOp::put(format!("k{i}").as_bytes(), b"v")).await;
+        assert!(matches!(reply, ClientReply::Applied), "got {reply:?}");
+    }
+    // No-op at 1 plus four puts: applied reaches 5, past the threshold.
+    drop(tx);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let s = BitcaskStorage::open(cfg.shard_raft_dir(0)).unwrap();
+    let snap = s.snapshot().unwrap().expect("a snapshot must have been taken");
+    assert!(snap.last_included_index >= 3, "got {}", snap.last_included_index);
+    assert!(s.first_index().unwrap() > 1, "the prefix must be gone");
+}
+
+/// Restart-from-snapshot equals restart-from-full-log: everything the client
+/// was told was `Applied` reads back, and the node keeps committing on top.
+#[tokio::test]
+async fn restart_from_snapshot_recovers_all_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config(dir.path(), BTreeMap::new());
+    cfg.snapshot_threshold = 2;
+
+    let (first, keep) = spawn(&cfg);
+    for i in 0..6 {
+        let reply = retrying(&first, || {
+            ClientOp::put(format!("k{i}").as_bytes(), format!("v{i}").as_bytes())
+        })
+        .await;
+        assert!(matches!(reply, ClientReply::Applied), "got {reply:?}");
+    }
+    drop((first, keep));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let (second, _keep) = spawn(&cfg);
+    for i in 0..6 {
+        let reply = read(&second, format!("k{i}").as_bytes()).await;
+        assert!(
+            matches!(reply, ClientReply::Value(Some(ref v)) if v == format!("v{i}").as_bytes()),
+            "k{i} lost across a snapshot restart, got {reply:?}"
+        );
+    }
+    // And the restarted node still commits: its log continues past the snapshot.
+    let reply = retrying(&second, || ClientOp::put(b"after", b"restart")).await;
+    assert!(matches!(reply, ClientReply::Applied), "got {reply:?}");
+    let reply = read(&second, b"after").await;
+    assert!(matches!(reply, ClientReply::Value(Some(ref v)) if v == b"restart"), "got {reply:?}");
+}
+
 /// A node that does not lead must refuse the write and name who does, rather
 /// than apply it locally. Two configured peers that never answer means this
 /// node can never win an election.
@@ -170,7 +247,8 @@ async fn kv_service_puts_and_gets_over_a_real_socket() {
     let (tx, _keep) = spawn(&config(dir.path(), BTreeMap::new()));
 
     let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-    let service = crate::kv_service::KvApi::new(tx.clone());
+    let service =
+        crate::kv_service::KvApi::new(tx.clone(), 1, crate::tests::support::published_one_shard(1));
     let addr = format!("127.0.0.1:{port}").parse().unwrap();
     tokio::spawn(async move {
         tonic::transport::Server::builder()
@@ -221,7 +299,8 @@ async fn a_reserved_key_is_refused_at_the_service_boundary() {
     let (tx, _keep) = spawn(&config(dir.path(), BTreeMap::new()));
 
     let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-    let service = crate::kv_service::KvApi::new(tx.clone());
+    let service =
+        crate::kv_service::KvApi::new(tx.clone(), 1, crate::tests::support::published_one_shard(1));
     let addr = format!("127.0.0.1:{port}").parse().unwrap();
     tokio::spawn(async move {
         tonic::transport::Server::builder()

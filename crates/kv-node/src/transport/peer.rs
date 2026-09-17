@@ -10,16 +10,19 @@
 //! the driver loop on one slow peer is what is *not* safe — it would stall
 //! every other peer and the node's own ticking. Never make this unbounded.
 
-use std::sync::Arc;
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use kv_proto::raft as pb;
 use kv_proto::raft::raft_service_client::RaftServiceClient;
 use kv_raft::{Message, NodeId};
 use tokio::sync::mpsc;
 use tonic::transport::{Channel, Endpoint};
 
-use super::convert::Outbound;
+use super::convert::{self, snapshot_chunks};
+use super::group::GroupId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum SendError {
@@ -36,6 +39,25 @@ pub struct PeerConfig {
     /// then never answers holds the sender task forever and the queue backs
     /// up behind it.
     pub request_timeout: Duration,
+    /// Deadline for one snapshot stream (M8). Snapshots carry the whole state
+    /// and legitimately take longer than a heartbeat-sized deadline; bounding
+    /// them separately keeps a huge state image from looking like a dead peer
+    /// while keeping a dead peer from pinning the transfer forever.
+    pub snapshot_timeout: Duration,
+    /// Messages coalesced into one `Batch` RPC (M11.3).
+    ///
+    /// A ceiling rather than a target: the loop sends whatever is already
+    /// queued, so a quiet link still sends one message per RPC and a busy one
+    /// amortizes the round trip across the whole drain. Bounded because the
+    /// batch is one gRPC message and AppendEntries carries log entries.
+    pub max_batch: usize,
+    /// Snapshot streams this peer may have open at once (M11.2).
+    ///
+    /// One flag per peer was right while a node hosted two groups; with a
+    /// group per shard it would let shard 7's multi-second transfer block
+    /// shard 8's indefinitely. A cap rather than no limit because every
+    /// concurrent stream is a whole state image on the wire.
+    pub max_snapshots_inflight: usize,
     pub backoff_initial: Duration,
     pub backoff_max: Duration,
 }
@@ -45,6 +67,9 @@ impl Default for PeerConfig {
         Self {
             queue_depth: 64,
             request_timeout: Duration::from_millis(500),
+            snapshot_timeout: Duration::from_secs(30),
+            max_batch: 256,
+            max_snapshots_inflight: 2,
             backoff_initial: Duration::from_millis(50),
             backoff_max: Duration::from_secs(5),
         }
@@ -52,8 +77,13 @@ impl Default for PeerConfig {
 }
 
 /// A connection to one peer: a bounded queue plus a task that drains it.
+///
+/// One per peer, carrying **every** group's traffic (M11.2). The group travels
+/// with each message rather than with the link, because a node hosting a Raft
+/// group per shard would otherwise open one connection, one queue and one
+/// reconnect loop per shard per peer.
 pub struct PeerClient {
-    tx: mpsc::Sender<Message>,
+    tx: mpsc::Sender<(GroupId, Message)>,
     /// Connection attempts made. Exposed because "it backs off rather than
     /// spinning" is not observable without counting — a busy loop and a
     /// correctly backing-off client look identical from the outside. The
@@ -75,7 +105,7 @@ impl PeerClient {
         peer: NodeId,
         addr: String,
         config: PeerConfig,
-        replies: mpsc::Sender<(NodeId, Message)>,
+        replies: mpsc::Sender<(GroupId, NodeId, Message)>,
     ) -> Self {
         let (tx, rx) = mpsc::channel(config.queue_depth);
         let attempts = Arc::new(AtomicU64::new(0));
@@ -89,9 +119,10 @@ impl PeerClient {
         }
     }
 
-    /// Queues `msg`, shedding it if the queue is full. Never blocks.
-    pub fn try_send(&self, msg: Message) -> Result<(), SendError> {
-        self.tx.try_send(msg).map_err(|e| match e {
+    /// Queues `msg` for `group`, shedding it if the queue is full. Never
+    /// blocks.
+    pub fn try_send(&self, group: GroupId, msg: Message) -> Result<(), SendError> {
+        self.tx.try_send((group, msg)).map_err(|e| match e {
             mpsc::error::TrySendError::Full(_) => SendError::Full,
             mpsc::error::TrySendError::Closed(_) => SendError::Closed,
         })
@@ -114,14 +145,36 @@ async fn run(
     peer: NodeId,
     addr: String,
     config: PeerConfig,
-    mut rx: mpsc::Receiver<Message>,
-    replies: mpsc::Sender<(NodeId, Message)>,
+    mut rx: mpsc::Receiver<(GroupId, Message)>,
+    replies: mpsc::Sender<(GroupId, NodeId, Message)>,
     attempts: Arc<AtomicU64>,
 ) {
     let mut client: Option<RaftServiceClient<Channel>> = None;
     let mut backoff = config.backoff_initial;
+    // A snapshot stream holds its RPC open for seconds, and heartbeats must
+    // keep flowing to this peer meanwhile — a follower whose election timer
+    // fires mid-transfer campaigns on a stale log, forces a term jump, and
+    // deposes the leader that was rescuing it. So the transfer runs beside the
+    // loop, not inside it.
+    //
+    // Keyed by group, and capped: one transfer per group at a time (a second
+    // would send the same image twice), and only so many across all groups at
+    // once (each is a whole state image on the wire). Anything shed here is
+    // re-driven by the next heartbeat.
+    let snapshots: Arc<Mutex<BTreeSet<GroupId>>> = Arc::new(Mutex::new(BTreeSet::new()));
 
-    while let Some(msg) = rx.recv().await {
+    while let Some(first) = rx.recv().await {
+        // Whatever else is already queued rides along. `try_recv` rather than
+        // a timer: waiting to fill a batch would add latency to the quiet
+        // case, and a busy link has its next messages queued already.
+        let mut batch = vec![first];
+        while batch.len() < config.max_batch {
+            match rx.try_recv() {
+                Ok(next) => batch.push(next),
+                Err(_) => break,
+            }
+        }
+
         if client.is_none() {
             attempts.fetch_add(1, Ordering::Relaxed);
             match dial(&addr, config.request_timeout).await {
@@ -130,7 +183,7 @@ async fn run(
                     backoff = config.backoff_initial;
                 }
                 Err(_) => {
-                    // Shed this message and wait before trying again. Sleeping
+                    // Shed this batch and wait before trying again. Sleeping
                     // here is what turns a dead peer into a slow trickle of
                     // attempts instead of a spin: the queue keeps filling and
                     // shedding meanwhile, which is the intended behaviour.
@@ -141,15 +194,52 @@ async fn run(
             }
         }
 
-        let Some(c) = client.as_mut() else { continue };
-        match send_one(c, msg, config.request_timeout).await {
-            Ok(Some(reply)) => {
-                // A full reply queue is shed like any other message.
-                let _ = replies.try_send((peer, reply));
+        // Snapshots leave the batch: each is a whole state image and travels
+        // on its own streaming RPC, beside this loop rather than inside it.
+        let mut envelopes = Vec::with_capacity(batch.len());
+        for (group, msg) in batch {
+            if !matches!(msg, Message::InstallSnapshot { .. }) {
+                envelopes.push(convert::envelope(group, msg));
+                continue;
             }
-            Ok(None) => {}
+            let admitted = {
+                let mut inflight = snapshots.lock().expect("snapshot set is never poisoned");
+                inflight.len() < config.max_snapshots_inflight && inflight.insert(group)
+            };
+            if !admitted {
+                continue;
+            }
+            let Some(c) = client.clone() else {
+                snapshots.lock().expect("snapshot set is never poisoned").remove(&group);
+                continue;
+            };
+            let replies = replies.clone();
+            let inflight = Arc::clone(&snapshots);
+            tokio::spawn(async move {
+                if let Ok(Some(reply)) = send_snapshot(c, msg, group, config.snapshot_timeout).await
+                {
+                    let _ = replies.try_send((group, peer, reply));
+                }
+                inflight.lock().expect("snapshot set is never poisoned").remove(&group);
+            });
+        }
+
+        if envelopes.is_empty() {
+            continue;
+        }
+
+        let Some(c) = client.as_mut() else { continue };
+        match send_batch(c, envelopes, config.request_timeout).await {
+            Ok(answers) => {
+                for (group, reply) in answers {
+                    // A full reply queue is shed like any other message. The
+                    // group rides along: a response carries no group of its
+                    // own, so the only record of which group asked is here.
+                    let _ = replies.try_send((group, peer, reply));
+                }
+            }
             Err(_) => {
-                // Drop the connection so the next message redials.
+                // Drop the connection so the next batch redials.
                 client = None;
             }
         }
@@ -176,29 +266,43 @@ fn jittered(base: Duration, peer: NodeId, attempts: &AtomicU64) -> Duration {
     base + Duration::from_millis(offset)
 }
 
-async fn send_one(
+/// Sends one batch and returns whatever came back, each reply tagged with the
+/// group that asked.
+///
+/// Fewer replies than envelopes is ordinary: the far side drops an envelope
+/// for a group it does not host or whose inbox is full, exactly as a lossy
+/// network drops a message, and the next heartbeat re-drives it.
+async fn send_batch(
     client: &mut RaftServiceClient<Channel>,
+    envelopes: Vec<pb::RaftEnvelope>,
+    timeout: Duration,
+) -> Result<Vec<(GroupId, Message)>, tonic::Status> {
+    let mut req = tonic::Request::new(pb::BatchRequest { msgs: envelopes });
+    req.set_timeout(timeout);
+    let answers = client.batch(req).await?.into_inner().msgs;
+    Ok(answers.into_iter().filter_map(|e| convert::unwrap_envelope(e).ok()).collect())
+}
+
+/// Streams one snapshot as chunks and resolves the install response. Runs
+/// beside the send loop (see `run`): holding the loop for a multi-second
+/// transfer would stall this peer's heartbeats past its election timeout.
+async fn send_snapshot(
+    mut client: RaftServiceClient<Channel>,
     msg: Message,
+    group: GroupId,
     timeout: Duration,
 ) -> Result<Option<Message>, tonic::Status> {
-    let reply = match Outbound::from(msg) {
-        Outbound::RequestVote(r) => {
-            let mut req = tonic::Request::new(r);
-            req.set_timeout(timeout);
-            Some(Outbound::RequestVoteResp(client.request_vote(req).await?.into_inner()))
-        }
-        Outbound::AppendEntries(r) => {
-            let mut req = tonic::Request::new(r);
-            req.set_timeout(timeout);
-            Some(Outbound::AppendEntriesResp(client.append_entries(req).await?.into_inner()))
-        }
-        // Responses are returned by the server as RPC responses, never sent as
-        // requests, so reaching here means the driver addressed a reply to a
-        // peer instead of answering an inbound RPC.
-        Outbound::RequestVoteResp(_)
-        | Outbound::AppendEntriesResp(_)
-        | Outbound::InstallSnapshotResp(_) => None,
-        Outbound::InstallSnapshot(_) => None, // M8
-    };
-    Ok(reply.and_then(|out| Message::try_from(out).ok()))
+    // Every chunk carries the group, so each one is self-describing and the
+    // server can route the transfer from the first chunk it sees.
+    let chunks: Vec<_> = snapshot_chunks(&msg)
+        .into_iter()
+        .map(|mut chunk| {
+            chunk.group = group;
+            chunk
+        })
+        .collect();
+    let mut req = tonic::Request::new(tokio_stream::iter(chunks));
+    req.set_timeout(timeout);
+    let resp = client.install_snapshot(req).await?.into_inner();
+    Ok(Message::try_from(convert::Outbound::InstallSnapshotResp(resp)).ok())
 }

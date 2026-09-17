@@ -18,6 +18,8 @@ bytes.workspace = true
 clap = { workspace = true, features = ["derive"] }
 crc32fast.workspace = true
 left-right.workspace = true
+io-uring.workspace = true
+libc.workspace = true
 prost.workspace = true
 rand.workspace = true
 serde = { workspace = true, features = ["derive"] }
@@ -26,6 +28,7 @@ tokio = { workspace = true, features = ["full"] }
 tonic.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
+tokio-stream.workspace = true
 
 [build-dependencies]
 tonic-build.workspace = true

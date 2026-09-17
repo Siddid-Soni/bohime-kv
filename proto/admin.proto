@@ -7,29 +7,111 @@ service AdminService {
   rpc AddNode(AddNodeRequest) returns (AddNodeResponse);
   rpc RemoveNode(RemoveNodeRequest) returns (RemoveNodeResponse);
   rpc ClusterStatus(ClusterStatusRequest) returns (ClusterStatusResponse);
+  // The placement every node routes by (M10).
+  rpc GetShardMap(GetShardMapRequest) returns (GetShardMapResponse);
   rpc Rebalance(RebalanceRequest) returns (RebalanceResponse);
   rpc VerifyShard(VerifyShardRequest) returns (VerifyShardResponse);
+}
+
+// Node ids start at 1 throughout, so 0 doubles as "this node knows of no
+// leader either" — the same convention kv.proto uses.
+message NotLeader {
+  uint64 leader_hint = 1;
 }
 
 message AddNodeRequest {
   uint64 node_id = 1;
   string address = 2;
 }
-message AddNodeResponse {}
+// The node joins as a learner and is promoted once it has caught up, so a
+// successful AddNode means "admitted", not "voting". Poll ClusterStatus for
+// the promotion.
+message AddNodeResponse {
+  NotLeader not_leader = 1;
+  // Log index of the committed membership entry.
+  uint64 index = 2;
+}
 
 message RemoveNodeRequest {
   uint64 node_id = 1;
 }
-message RemoveNodeResponse {}
+message RemoveNodeResponse {
+  NotLeader not_leader = 1;
+  uint64 index = 2;
+}
 
 message ClusterStatusRequest {}
+// One replica's view, not a distributed snapshot: a follower's copy lags the
+// leader's by however far behind its log is.
 message ClusterStatusResponse {
+  // M10, once a node serves more than one shard.
   repeated ShardStatus shards = 1;
+  // M9: the single Raft group this node serves.
+  uint64 node_id = 2;
+  uint64 leader_id = 3;
+  uint64 term = 4;
+  repeated Member members = 5;
+  uint64 commit_index = 6;
+  uint64 applied_index = 7;
+  // The live log's bounds. `first_index` above 1 means the prefix below it has
+  // been replaced by a snapshot (M8), which is what an operator looks at to
+  // see whether compaction is keeping up.
+  uint64 log_first_index = 8;
+  uint64 log_last_index = 9;
+}
+message Member {
+  uint64 node_id = 1;
+  string address = 2;
+  // False while the node is still a learner: replicating, not yet counted in
+  // any quorum.
+  bool voter = 3;
 }
 message ShardStatus {
   uint32 shard_id = 1;
   uint64 leader_id = 2;
   repeated uint64 replicas = 3;
+  // This replica's term for the shard, and whether it is the one leading.
+  // The term is what tells a shard that is quietly idle from one that is
+  // thrashing through elections — they look identical from `leader_id` alone,
+  // and only one of them is a problem.
+  uint64 term = 4;
+  bool leading = 5;
+  uint64 applied_index = 6;
+}
+
+message GetShardMapRequest {
+  // Confirm leadership of the meta group through ReadIndex before answering,
+  // instead of serving this replica's applied copy.
+  //
+  // Default false, and that is the right default: routing wants the cached
+  // map, which every replica can serve and which costs nothing. A node routing
+  // by a map one version old sends the request to a node that redirects it —
+  // a wasted hop, not a wrong answer. Ask for the linearizable one when the
+  // *version* is what matters, and pay a quorum round trip for it.
+  bool linearizable = 1;
+}
+
+// proto3 has no repeated-of-repeated, so a shard's replica list is its own
+// message rather than a flattened array with a stride an operator has to know.
+message ShardReplicas {
+  repeated uint64 replicas = 1;
+}
+
+message GetShardMapResponse {
+  // Only ever set for a linearizable read: the published copy is answerable
+  // by any replica.
+  NotLeader not_leader = 1;
+  // Bumped on every republish. Zero means no map has been bootstrapped yet,
+  // which a cluster is only in for the moment between starting and its meta
+  // group's first election.
+  uint64 version = 2;
+  uint32 num_shards = 3;
+  uint32 replication_factor = 4;
+  // The cluster the map was computed for: the data group's voters.
+  repeated uint64 nodes = 5;
+  // Indexed by shard id, so `shards[i]` is shard `i`'s replica set in ring
+  // order. Always `num_shards` long.
+  repeated ShardReplicas shards = 6;
 }
 
 message RebalanceRequest {}

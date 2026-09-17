@@ -8,6 +8,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::membership::ClusterConfig;
+
 pub type Term = u64;
 pub type LogIndex = u64;
 pub type NodeId = u64;
@@ -34,10 +36,16 @@ pub struct HardState {
 }
 
 /// A state machine snapshot replacing the log prefix up to and including
-/// `last_included_index`. Produced and consumed at M8.
+/// `last_included_index`. Produced and consumed at M8; the membership at M9.
+///
+/// `config` is the cluster as of the boundary: conf entries at or below it
+/// are gone with the prefix, so without this a node that compacted past its
+/// last conf change would forget who votes. A node that restarts replays the
+/// log over this base the same way it replays state over `data`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
     pub last_included_index: LogIndex,
     pub last_included_term: Term,
     pub data: Vec<u8>,
+    pub config: ClusterConfig,
 }

@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 
 const HARD_STATE_KEY: &[u8] = b"\x00hard_state";
 const LOG_META_KEY: &[u8] = b"\x00log_meta";
+const SNAPSHOT_KEY: &[u8] = b"\x00snapshot";
 
 fn entry_key(index: LogIndex) -> Vec<u8> {
     format!("e{index:020}").into_bytes()
@@ -31,6 +32,14 @@ fn entry_key(index: LogIndex) -> Vec<u8> {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 struct LogMeta {
     last_index: LogIndex,
+    /// One past the highest truncated prefix index. `#[serde(default)]` keeps
+    /// directories written before M8 readable — they simply have no prefix.
+    #[serde(default = "default_base")]
+    base_index: LogIndex,
+}
+
+fn default_base() -> LogIndex {
+    1
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -56,21 +65,33 @@ pub struct BitcaskStorage {
     #[cfg(test)]
     path: PathBuf,
     last_index: LogIndex,
+    base: LogIndex,
+    snapshot: Option<Snapshot>,
 }
 
 impl BitcaskStorage {
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, BitcaskStorageError> {
         let path = dir.as_ref().to_path_buf();
-        let mut engine = Engine::open(&path)?;
-        let last_index = match engine.get(LOG_META_KEY)? {
-            Some(bytes) => bincode::deserialize::<LogMeta>(&bytes)?.last_index,
-            None => 0,
+        let engine = Engine::open(&path)?;
+        let (last_index, base) = match engine.get(LOG_META_KEY)? {
+            Some(bytes) => {
+                let meta: LogMeta = bincode::deserialize(&bytes)?;
+                (meta.last_index, meta.base_index.max(1))
+            }
+            None => (0, 1),
+        };
+        let snapshot: Option<Snapshot> = match engine.get(SNAPSHOT_KEY)? {
+            Some(bytes) => Some(bincode::deserialize(&bytes)?),
+            None => None,
         };
         Ok(Self {
             engine: RefCell::new(engine),
             #[cfg(test)]
             path,
-            last_index,
+            last_index: last_index
+                .max(snapshot.as_ref().map(|s| s.last_included_index).unwrap_or(0)),
+            base,
+            snapshot,
         })
     }
 
@@ -96,7 +117,8 @@ impl BitcaskStorage {
     }
 
     fn put_meta(&self) -> Result<(), BitcaskStorageError> {
-        let encoded = bincode::serialize(&LogMeta { last_index: self.last_index })?;
+        let encoded =
+            bincode::serialize(&LogMeta { last_index: self.last_index, base_index: self.base })?;
         self.engine.borrow_mut().put(LOG_META_KEY, &encoded)?;
         Ok(())
     }
@@ -143,8 +165,10 @@ impl RaftStorage for BitcaskStorage {
     fn entries(&self, lo: LogIndex, hi: LogIndex) -> Result<Vec<Entry>, Self::Error> {
         let hi = hi.min(self.last_index + 1);
         let mut out = Vec::new();
-        let mut engine = self.engine.borrow_mut();
-        for index in lo.max(1)..hi {
+        // A read-only borrow now that `Engine::get` takes `&self`, so this no
+        // longer contends with any other reader of the same storage.
+        let engine = self.engine.borrow();
+        for index in lo.max(1).max(self.base)..hi {
             if let Some(bytes) = engine.get(&entry_key(index))? {
                 out.push(bincode::deserialize(&bytes)?);
             }
@@ -159,20 +183,33 @@ impl RaftStorage for BitcaskStorage {
         if idx > self.last_index {
             return Ok(None);
         }
-        match self.engine.borrow_mut().get(&entry_key(idx))? {
-            Some(bytes) => Ok(Some(bincode::deserialize::<Entry>(&bytes)?.term)),
-            None => Ok(None),
+        if let Some(bytes) = self.engine.borrow().get(&entry_key(idx))? {
+            return Ok(Some(bincode::deserialize::<Entry>(&bytes)?.term));
         }
+        // The boundary term survives the prefix it describes; below it the
+        // log is gone and only the snapshot knows anything.
+        if let Some(snap) = &self.snapshot
+            && idx == snap.last_included_index
+        {
+            return Ok(Some(snap.last_included_term));
+        }
+        Ok(None)
     }
 
     fn truncate_suffix(&mut self, from: LogIndex) -> Result<(), Self::Error> {
         if from > self.last_index {
             return Ok(());
         }
-        for index in from..=self.last_index {
+        // Never truncate into the snapshot: a suffix conflict at or below the
+        // compacted prefix means everything live diverges, so drop all of it
+        // and fall back to the snapshot boundary.
+        let floor =
+            self.base.max(self.snapshot.as_ref().map(|s| s.last_included_index + 1).unwrap_or(1));
+        for index in from.max(floor)..=self.last_index {
             self.engine.borrow_mut().delete(&entry_key(index))?;
         }
-        self.last_index = from.saturating_sub(1);
+        let snap_last = self.snapshot.as_ref().map(|s| s.last_included_index).unwrap_or(0);
+        self.last_index = from.saturating_sub(1).max(snap_last);
         self.put_meta()
     }
 
@@ -181,6 +218,38 @@ impl RaftStorage for BitcaskStorage {
     }
 
     fn snapshot(&self) -> Result<Option<Snapshot>, Self::Error> {
-        Ok(None)
+        Ok(self.snapshot.clone())
+    }
+
+    fn save_snapshot(&mut self, snapshot: &Snapshot) -> Result<(), Self::Error> {
+        let encoded = bincode::serialize(snapshot)?;
+        self.engine.borrow_mut().put(SNAPSHOT_KEY, &encoded)?;
+        self.last_index = self.last_index.max(snapshot.last_included_index);
+        self.snapshot = Some(snapshot.clone());
+        self.put_meta()
+    }
+
+    fn first_index(&self) -> Result<LogIndex, Self::Error> {
+        Ok(self.base)
+    }
+
+    fn truncate_prefix(&mut self, up_to: LogIndex) -> Result<(), Self::Error> {
+        if up_to < self.base {
+            return Ok(());
+        }
+        // Meta first, entries after. A crash between them then leaves the
+        // entries redundantly stored behind an advanced base — invisible via
+        // `entries`/`first_index`, still answering the same terms — instead of
+        // entries missing below a base that claims them gone, which would make
+        // the leader send a `prev_log_term` of 0 and stall the follower. The
+        // leftovers are reclaimed by the next truncation past them; they are
+        // never wrong, only briefly wasteful.
+        let old_base = self.base;
+        self.base = up_to + 1;
+        self.put_meta()?;
+        for index in old_base..=up_to {
+            self.engine.borrow_mut().delete(&entry_key(index))?;
+        }
+        Ok(())
     }
 }

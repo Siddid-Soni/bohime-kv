@@ -1,1 +1,3 @@
-mod wiring;
+mod hash;
+mod map;
+mod ring;

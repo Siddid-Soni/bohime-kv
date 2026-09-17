@@ -70,3 +70,33 @@ fn no_real_command_encodes_to_nothing() {
 fn garbage_is_an_error_not_a_silent_no_op() {
     assert!(Command::decode(&[0xff, 0xff, 0xff, 0xff, 0xff]).is_err());
 }
+
+/// Membership entries share the log with commands, told apart by magic prefix
+/// (M9). That routing is load-bearing — a command misread as conf would move
+/// the quorum, and conf misread as command would hit the state machine — so
+/// the non-collision is pinned here, next to the no-op pins above: every real
+/// command starts with the `ctx: Option` tag byte, `0x00` or `0x01`, which the
+/// `RCF9` magic never starts with.
+#[test]
+fn no_real_command_collides_with_a_conf_entry() {
+    use kv_raft::membership::{CONF_MAGIC, decode_conf};
+
+    let cmds = vec![
+        put(b"k", b"v"),
+        put(b"", b""),
+        Command::new(None, Mutation::Delete { key: b"k".to_vec() }),
+        Command::new(
+            Some(RequestCtx { client_id: 7, sequence: 3 }),
+            Mutation::Cas { key: b"k".to_vec(), expected: None, new_value: b"v".to_vec() },
+        ),
+    ];
+    for cmd in &cmds {
+        let bytes = cmd.encode();
+        assert!(
+            bytes.first().is_some_and(|b| *b == 0x00 || *b == 0x01),
+            "first byte is the Option tag: {bytes:?}"
+        );
+        assert!(!bytes.starts_with(&CONF_MAGIC), "command must not carry the conf magic");
+        assert!(decode_conf(&bytes).is_none(), "a command must never decode as conf");
+    }
+}

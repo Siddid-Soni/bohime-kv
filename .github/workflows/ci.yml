@@ -40,16 +40,46 @@ jobs:
       - name: test
         run: cargo nextest run --workspace
 
-      # M4's reproducibility dies silently if either pure crate gains an async
-      # runtime, and nothing else in CI would notice.
-      - name: kv-raft and kv-sim stay free of tokio
+      # The read path submits through io_uring where the kernel allows it and
+      # falls back to pread otherwise. Which one a given runner takes is not
+      # ours to decide — hosted runners, containers and seccomp profiles all
+      # vary, and `io_uring_disabled` is set on plenty of production hosts. So
+      # the fallback is gated explicitly rather than left to whichever path the
+      # runner happens to pick, because an untested fallback is not a fallback.
+      - name: test (blocking read path)
+        env:
+          BOHIME_READ_ENGINE: blocking
+        run: cargo nextest run --workspace
+
+      # M4's reproducibility dies silently if a pure crate gains an async
+      # runtime, and nothing else in CI would notice. kv-ring joined the list
+      # at M10: placement is a pure function of the node set, and M11's
+      # simulator has to be able to call it.
+      - name: the pure crates stay free of tokio
         run: |
-          for crate in kv-raft kv-sim; do
+          for crate in kv-raft kv-ring kv-sim; do
             if cargo tree -p "$crate" -e normal | grep -q tokio; then
               echo "::error::$crate depends on tokio; the deterministic simulator requires it not to"
               exit 1
             fi
           done
+
+      # M11.5's keydir is behind a flag, so both settings are real
+      # configurations and both have to work. The suite above runs the
+      # default; this runs the comparison arm's own tests, which is what
+      # keeps `--keydir locked` from rotting into a type that compiles.
+      - name: test (locked keydir)
+        run: cargo nextest run -p kv-node -E 'test(wait_free_reads)'
+
+      # The loom model needs the whole of kv-storage built with `--cfg loom`
+      # so that left-right's atomics are loom's rather than std's; without it
+      # the model explores almost nothing. That also means every other test
+      # in the crate is `cfg(not(loom))`, so this is a separate build and a
+      # separate run rather than part of the suite above.
+      - name: loom model (keydir)
+        env:
+          RUSTFLAGS: --cfg loom
+        run: cargo test -p kv-storage --lib loom_index
 
       # The 10k-seed election gate is ~2s, so it runs on every push. The
       # 100k-seed nemesis gate takes ~80 minutes and runs nightly instead —

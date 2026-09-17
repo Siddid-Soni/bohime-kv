@@ -1,3 +1,4 @@
+use crate::membership::ClusterConfig;
 use crate::message::{Config, Message, Ready};
 use crate::types::{Entry, HardState};
 
@@ -33,8 +34,10 @@ fn every_message_variant_round_trips_through_bincode() {
             last_included_index: 50,
             last_included_term: 2,
             data: vec![7; 16],
+            config: ClusterConfig::voting([1, 2, 3]),
         },
         Message::InstallSnapshotResp { term: 3, success: true },
+        Message::TimeoutNow { term: 3, leader_id: 1 },
     ];
 
     for msg in &messages {
@@ -54,6 +57,7 @@ fn ready_holds_entries_hard_state_and_messages_together() {
         hard_state: Some(hs),
         committed: vec![entry],
         read_states: vec![],
+        snapshot: None,
     };
 
     assert!(!ready.is_empty());
@@ -64,8 +68,14 @@ fn ready_holds_entries_hard_state_and_messages_together() {
 
 #[test]
 fn single_node_config_has_quorum_one() {
-    let config =
-        Config { id: 1, peers: vec![], election_timeout: 10, heartbeat_interval: 2, seed: 0 };
+    let config = Config {
+        id: 1,
+        peers: vec![],
+        election_timeout: 10,
+        heartbeat_interval: 2,
+        seed: 0,
+        initial_learner: false,
+    };
     assert_eq!(config.cluster_size(), 1);
     assert_eq!(config.quorum(), 1);
     assert_eq!(config.all_nodes(), vec![1]);
@@ -73,8 +83,14 @@ fn single_node_config_has_quorum_one() {
 
 #[test]
 fn three_node_config_has_quorum_two() {
-    let config =
-        Config { id: 1, peers: vec![2, 3], election_timeout: 10, heartbeat_interval: 2, seed: 0 };
+    let config = Config {
+        id: 1,
+        peers: vec![2, 3],
+        election_timeout: 10,
+        heartbeat_interval: 2,
+        seed: 0,
+        initial_learner: false,
+    };
     assert_eq!(config.cluster_size(), 3);
     assert_eq!(config.quorum(), 2);
 }

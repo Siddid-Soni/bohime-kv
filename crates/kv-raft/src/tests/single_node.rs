@@ -8,8 +8,14 @@ use crate::node::RaftNode;
 use crate::storage::MemStorage;
 
 fn solo() -> RaftNode<MemStorage> {
-    let config =
-        Config { id: 1, peers: vec![], election_timeout: 10, heartbeat_interval: 2, seed: 1 };
+    let config = Config {
+        id: 1,
+        peers: vec![],
+        election_timeout: 10,
+        heartbeat_interval: 2,
+        seed: 1,
+        initial_learner: false,
+    };
     RaftNode::new(config, MemStorage::default())
 }
 

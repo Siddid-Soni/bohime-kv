@@ -1,5 +1,6 @@
+use crate::membership::ClusterConfig;
 use crate::storage::{MemStorage, RaftStorage, StorageError};
-use crate::types::{Entry, HardState, LogIndex, Term};
+use crate::types::{Entry, HardState, LogIndex, Snapshot, Term};
 
 fn entry(index: LogIndex, term: Term) -> Entry {
     Entry { term, index, command: vec![index as u8] }
@@ -58,6 +59,46 @@ fn truncate_past_the_end_is_a_noop() {
     s.append(&[entry(1, 1)]).unwrap();
     s.truncate_suffix(99).unwrap();
     assert_eq!(s.last_index().unwrap(), 1);
+}
+
+#[test]
+fn save_snapshot_persists_and_term_covers_the_boundary() {
+    let mut s = MemStorage::default();
+    s.append(&[entry(1, 1), entry(2, 1), entry(3, 2)]).unwrap();
+
+    let snap = Snapshot {
+        last_included_index: 2,
+        last_included_term: 1,
+        data: vec![7; 8],
+        config: ClusterConfig::default(),
+    };
+    s.save_snapshot(&snap).unwrap();
+    assert_eq!(s.snapshot().unwrap(), Some(snap.clone()));
+
+    s.truncate_prefix(2).unwrap();
+    assert_eq!(s.first_index().unwrap(), 3);
+    // The boundary term survives the prefix it describes; below it is gone.
+    assert_eq!(s.term(2).unwrap(), Some(1));
+    assert_eq!(s.term(1).unwrap(), None);
+    assert_eq!(s.snapshot().unwrap(), Some(snap));
+}
+
+#[test]
+fn append_continues_after_a_fully_compacted_prefix() {
+    let mut s = MemStorage::default();
+    s.append(&[entry(1, 1), entry(2, 1)]).unwrap();
+    s.save_snapshot(&Snapshot {
+        last_included_index: 2,
+        last_included_term: 1,
+        data: vec![],
+        config: ClusterConfig::default(),
+    })
+    .unwrap();
+    s.truncate_prefix(2).unwrap();
+
+    assert_eq!(s.last_index().unwrap(), 2);
+    s.append(&[entry(3, 1)]).unwrap();
+    assert_eq!(s.entries(1, 10).unwrap(), vec![entry(3, 1)]);
 }
 
 #[test]

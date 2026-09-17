@@ -1,3 +1,4 @@
+use crate::membership::ClusterConfig;
 use crate::types::{Entry, HardState, Snapshot};
 
 #[test]
@@ -27,7 +28,12 @@ fn default_hard_state_is_term_zero_no_vote() {
 
 #[test]
 fn snapshot_round_trips() {
-    let snap = Snapshot { last_included_index: 100, last_included_term: 5, data: vec![9; 64] };
+    let snap = Snapshot {
+        last_included_index: 100,
+        last_included_term: 5,
+        data: vec![9; 64],
+        config: ClusterConfig::default(),
+    };
     let decoded: Snapshot = bincode::deserialize(&bincode::serialize(&snap).unwrap()).unwrap();
     assert_eq!(snap, decoded);
 }

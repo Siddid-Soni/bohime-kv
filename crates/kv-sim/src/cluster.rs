@@ -88,6 +88,7 @@ impl Cluster {
                 // Per-node seeds derived from the run seed, so each node
                 // randomises its timeout differently but reproducibly.
                 seed: config.seed.wrapping_mul(1_000_003).wrapping_add(id),
+                initial_learner: false,
             };
             nodes.insert(id, RaftNode::new(cfg, MemStorage::default()));
         }
@@ -170,6 +171,7 @@ impl Cluster {
             election_timeout: self.config.election_timeout,
             heartbeat_interval: self.config.heartbeat_interval,
             seed: self.config.seed.wrapping_mul(1_000_003).wrapping_add(id),
+            initial_learner: false,
         };
         self.nodes.insert(id, RaftNode::new(cfg, storage));
         self.roles.insert(id, (Role::Follower, 0));

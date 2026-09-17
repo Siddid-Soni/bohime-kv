@@ -8,6 +8,7 @@ pub mod conformance;
 pub mod election;
 pub mod invariants;
 pub mod log;
+pub mod membership;
 pub mod message;
 pub mod node;
 pub mod replication;
@@ -17,6 +18,7 @@ pub mod types;
 #[cfg(test)]
 mod tests;
 
+pub use membership::{ClusterConfig, ConfChange, ConfError, ConfOp, ConfProposeError};
 pub use message::{Action, Config, Message, ProposeError, ReadIndexError, ReadState, Ready, Role};
 pub use node::RaftNode;
 pub use types::{Entry, HardState, LogIndex, NodeId, Snapshot, Term};

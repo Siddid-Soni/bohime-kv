@@ -1,4 +1,4 @@
-use crate::message::ProposeError;
+use crate::message::{Action, Message, ProposeError};
 use crate::tests::harness::Cluster;
 use crate::types::Entry;
 
@@ -107,13 +107,17 @@ fn figure_8_stale_term_entry_is_not_committed_by_count() {
             }
         }
         // Force a new term the honest way: step down on a higher term, then
-        // win it back with the freshest log.
+        // win it back with the freshest log. The high term has to come from a
+        // real member — since M9 a message from outside the config is dropped
+        // before the term rules run, so a made-up sender would not depose
+        // anyone (`stranger_messages_do_not_force_a_step_down`).
+        let usurper = cluster.nodes.iter().find(|n| n.id() != leader).unwrap().id();
         let ldr = cluster.nodes.iter_mut().find(|n| n.id() == leader).unwrap();
         ldr.step(
-            99,
+            usurper,
             Message::RequestVote {
                 term: 99,
-                candidate_id: 99,
+                candidate_id: usurper,
                 last_log_index: 0,
                 last_log_term: 0,
             },
@@ -222,5 +226,79 @@ fn committed_entries_apply_in_order() {
             None => seen_terms = Some(terms),
             Some(t) => assert_eq!(t, &terms, "all replicas apply the same sequence"),
         }
+    }
+}
+
+/// A burst of proposals costs one AppendEntries per peer, not one per
+/// proposal.
+///
+/// `propose` used to broadcast immediately, so N writes arriving between two
+/// `ready()` calls sent N messages to every peer — each a superset of the one
+/// before it, since `send_append` always ships everything from `next_index`.
+/// Only the last was load-bearing. Raft's log is already a total order, so
+/// batching them changes nothing about what replicates, only how many times.
+///
+/// Liveness does not depend on this flush: a proposal that never reaches a
+/// `ready()` still goes out on the next heartbeat, which sends from
+/// `next_index` regardless.
+#[test]
+fn proposals_arriving_together_share_one_append() {
+    let mut cluster = Cluster::of_three();
+    let leader = cluster.run_until_leader(500);
+
+    // Drop the election's own traffic so only the proposals are counted.
+    for node in cluster.nodes.iter_mut() {
+        let _ = node.ready();
+    }
+
+    let ldr = cluster.nodes.iter_mut().find(|n| n.id() == leader).unwrap();
+    for cmd in [b"a".to_vec(), b"b".to_vec(), b"c".to_vec(), b"d".to_vec()] {
+        ldr.propose(cmd).unwrap();
+    }
+
+    let messages = ldr.ready().messages;
+    assert_eq!(messages.len(), 2, "one AppendEntries per peer, not one per proposal");
+
+    for (_, msg) in &messages {
+        let Message::AppendEntries { entries, .. } = msg else {
+            panic!("expected AppendEntries, got {msg:?}");
+        };
+        let commands: Vec<_> = entries.iter().map(|e| e.command.clone()).collect();
+        assert_eq!(
+            commands,
+            vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec(), b"d".to_vec()],
+            "the one message must carry the whole batch"
+        );
+    }
+}
+
+/// `tick`/`step` and `ready` are alternative drains of the *same* queue, so a
+/// proposal deferred by `propose` must surface in whichever one the caller
+/// uses. kv-raft's own test harness drives nodes by the actions `tick` returns
+/// and never calls `ready`; without a flush there, a proposal would sit unsent
+/// until the heartbeat interval elapsed.
+#[test]
+fn a_deferred_proposal_surfaces_in_the_next_tick() {
+    let mut cluster = Cluster::of_three();
+    let leader = cluster.run_until_leader(500);
+    let ldr = cluster.nodes.iter_mut().find(|n| n.id() == leader).unwrap();
+    let _ = ldr.ready();
+
+    ldr.propose(b"deferred".to_vec()).unwrap();
+
+    // The very next tick, well inside the heartbeat interval, must carry it.
+    let sent: Vec<_> = ldr
+        .tick()
+        .into_iter()
+        .filter_map(|action| match action {
+            Action::Send { to, msg: Message::AppendEntries { entries, .. } } => Some((to, entries)),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(sent.len(), 2, "one AppendEntries per peer on the next tick");
+    for (to, entries) in sent {
+        let commands: Vec<_> = entries.iter().map(|e| e.command.clone()).collect();
+        assert_eq!(commands, vec![b"deferred".to_vec()], "peer {to} must receive the proposal");
     }
 }

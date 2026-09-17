@@ -39,14 +39,36 @@ impl FsyncPolicy {
     }
 }
 
+/// Which keydir implementation the engine holds (M11.5, plan §1.15).
+///
+/// A flag rather than a compile-time choice because the two have different
+/// costs and neither dominates: left-right doubles the keydir's memory (plus
+/// the pending overlay) to buy reads that never take a lock, and the keydir is
+/// ~40 bytes a key with every key resident. An operator with 10M keys a shard
+/// and a read-light workload should be able to say no.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IndexKind {
+    /// `Arc<RwLock<HashMap>>`. Every write is visible the moment it returns.
+    Locked,
+    /// Wait-free reads through two copies and an oplog. A write is visible
+    /// only after `publish`.
+    #[default]
+    LeftRight,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EngineConfig {
     pub max_segment_size: u64,
     pub fsync_policy: FsyncPolicy,
+    pub index: IndexKind,
 }
 
 impl Default for EngineConfig {
     fn default() -> Self {
-        Self { max_segment_size: 64 * 1024 * 1024, fsync_policy: FsyncPolicy::EveryWrite }
+        Self {
+            max_segment_size: 64 * 1024 * 1024,
+            fsync_policy: FsyncPolicy::EveryWrite,
+            index: IndexKind::default(),
+        }
     }
 }

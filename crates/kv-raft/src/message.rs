@@ -4,7 +4,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::{Entry, HardState, LogIndex, NodeId, Term};
+use crate::membership::ClusterConfig;
+use crate::types::{Entry, HardState, LogIndex, NodeId, Snapshot, Term};
 
 /// Static configuration of one Raft group member. `seed` drives election
 /// timeout randomization deterministically — never `thread_rng`, or M4's
@@ -19,6 +20,12 @@ pub struct Config {
     /// Ticks between leader heartbeats. Must be well below `election_timeout`.
     pub heartbeat_interval: u64,
     pub seed: u64,
+    /// True when this node joins an existing group as a learner (M9): it
+    /// starts in `peers`' voters' shadow — replicating, never campaigning —
+    /// until someone proposes promoting it. False for founding members.
+    /// Only read on a fresh store; once the log or snapshot holds membership,
+    /// they own it and this flag is history.
+    pub initial_learner: bool,
 }
 
 impl Config {
@@ -94,10 +101,29 @@ pub enum Message {
         last_included_index: LogIndex,
         last_included_term: Term,
         data: Vec<u8>,
+        /// The membership as of the boundary (M9). Conf entries at or below
+        /// it are gone with the prefix; without this the follower would keep
+        /// its stale config and disagree about every quorum.
+        config: ClusterConfig,
     },
     InstallSnapshotResp {
         term: Term,
         success: bool,
+    },
+    /// Leadership handoff (M9). A leader that has committed its own removal
+    /// sends this to the most-caught-up voter, which campaigns at once instead
+    /// of waiting out its election timeout. Without it, removing the leader
+    /// costs an unavailability window the operator chose, not one the protocol
+    /// needed.
+    TimeoutNow {
+        term: Term,
+        leader_id: NodeId,
+    },
+    /// The transport-level acknowledgement of a `TimeoutNow`: the campaign it
+    /// triggers travels as a separate `RequestVote`, so the RPC itself needs
+    /// no Raft semantics — just an answer for the request/response plumbing.
+    TimeoutNowResp {
+        term: Term,
     },
 }
 
@@ -110,7 +136,9 @@ impl Message {
             | Message::AppendEntries { term, .. }
             | Message::AppendEntriesResp { term, .. }
             | Message::InstallSnapshot { term, .. }
-            | Message::InstallSnapshotResp { term, .. } => term,
+            | Message::InstallSnapshotResp { term, .. }
+            | Message::TimeoutNow { term, .. }
+            | Message::TimeoutNowResp { term } => term,
         }
     }
 }
@@ -119,10 +147,19 @@ impl Message {
 /// The core never sends, fsyncs, or applies — it only describes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    Send { to: NodeId, msg: Message },
+    Send {
+        to: NodeId,
+        msg: Message,
+    },
     PersistEntries(Vec<Entry>),
     PersistHardState(HardState),
-    ApplyEntries { up_to: LogIndex },
+    ApplyEntries {
+        up_to: LogIndex,
+    },
+    /// A received snapshot was installed into storage. The caller must restore
+    /// its state machine from the snapshot data and treat everything through
+    /// `last_included_index` as applied — none of it will arrive as entries.
+    ApplySnapshot(Snapshot),
 }
 
 /// Why a leader cannot serve a read right now.
@@ -168,6 +205,10 @@ pub struct Ready {
     pub hard_state: Option<HardState>,
     pub committed: Vec<Entry>,
     pub read_states: Vec<ReadState>,
+    /// A snapshot the caller must restore its state machine from (M8). Set at
+    /// most once per drain; the caller syncs storage before acting on it, like
+    /// every other durable state in this struct.
+    pub snapshot: Option<Snapshot>,
 }
 
 impl Ready {
@@ -177,6 +218,7 @@ impl Ready {
             && self.hard_state.is_none()
             && self.committed.is_empty()
             && self.read_states.is_empty()
+            && self.snapshot.is_none()
     }
 }
 

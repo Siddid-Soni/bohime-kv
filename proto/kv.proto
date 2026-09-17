@@ -19,6 +19,21 @@ message NotLeader {
   uint64 leader_hint = 1;
 }
 
+// This node does not replicate the key's shard (M11).
+//
+// An ordinary answer, like NotLeader, rather than an error: it is what a
+// client whose cached shard map is a version behind gets, and a client handed
+// an error would drop the connection instead of re-routing. The replica list
+// is what turns the retry into one redirect instead of a scan.
+message NotHosted {
+  uint32 shard = 1;
+  // The shard's replica set in ring order, as this node's map has it.
+  repeated uint64 replicas = 2;
+  // Which version of the map said so, so a client can tell "my map is stale"
+  // from "this node's map is stale".
+  uint64 map_version = 3;
+}
+
 message GetRequest {
   bytes key = 1;
 }
@@ -26,6 +41,7 @@ message GetRequest {
 message GetResponse {
   optional bytes value = 1;
   optional NotLeader not_leader = 2;
+  optional NotHosted not_hosted = 3;
 }
 
 message PutRequest {
@@ -36,6 +52,7 @@ message PutRequest {
 
 message PutResponse {
   optional NotLeader not_leader = 1;
+  optional NotHosted not_hosted = 2;
 }
 
 message DeleteRequest {
@@ -45,6 +62,7 @@ message DeleteRequest {
 
 message DeleteResponse {
   optional NotLeader not_leader = 1;
+  optional NotHosted not_hosted = 2;
 }
 
 message CasRequest {
@@ -57,4 +75,5 @@ message CasRequest {
 message CasResponse {
   bool swapped = 1;
   optional NotLeader not_leader = 2;
+  optional NotHosted not_hosted = 3;
 }

@@ -37,7 +37,7 @@ fn reopen_replays_existing_keys() {
     engine.put(b"k2", b"v2").unwrap();
     drop(engine);
 
-    let mut reopened = Engine::open(path).unwrap();
+    let reopened = Engine::open(path).unwrap();
     assert_eq!(reopened.get(b"k1").unwrap(), Some(b"v1".to_vec()));
     assert_eq!(reopened.get(b"k2").unwrap(), Some(b"v2".to_vec()));
 }
@@ -52,7 +52,7 @@ fn reopen_replays_overwrite_as_latest_value() {
     engine.put(b"k", b"v2").unwrap();
     drop(engine);
 
-    let mut reopened = Engine::open(path).unwrap();
+    let reopened = Engine::open(path).unwrap();
     assert_eq!(reopened.get(b"k").unwrap(), Some(b"v2".to_vec()));
 }
 
@@ -66,7 +66,7 @@ fn reopen_after_delete_stays_deleted() {
     engine.delete(b"k").unwrap();
     drop(engine);
 
-    let mut reopened = Engine::open(path).unwrap();
+    let reopened = Engine::open(path).unwrap();
     assert_eq!(reopened.get(b"k").unwrap(), None);
 }
 
@@ -88,7 +88,7 @@ fn writes_after_reopen_append_correctly() {
     assert_eq!(reopened.get(b"k2").unwrap(), Some(b"v2".to_vec()));
 
     drop(reopened);
-    let mut reopened_again = Engine::open(path).unwrap();
+    let reopened_again = Engine::open(path).unwrap();
     assert_eq!(reopened_again.get(b"k1").unwrap(), Some(b"v1".to_vec()));
     assert_eq!(reopened_again.get(b"k2").unwrap(), Some(b"v2".to_vec()));
 }
@@ -106,7 +106,7 @@ fn write_10k_keys_drop_reopen_all_readable() {
     }
     drop(engine);
 
-    let mut reopened = Engine::open(path).unwrap();
+    let reopened = Engine::open(path).unwrap();
     for i in 0..10_000u32 {
         let key = format!("key-{i}").into_bytes();
         let expected = format!("value-{i}").into_bytes();
@@ -168,7 +168,7 @@ fn reopen_replays_across_multiple_segments() {
     assert!(segment_file_count(path) > 1, "test setup should span multiple segments");
     drop(engine);
 
-    let mut reopened = Engine::open_with_max_segment_size(path, 64).unwrap();
+    let reopened = Engine::open_with_max_segment_size(path, 64).unwrap();
     for i in 0..20u32 {
         let expected = format!("value-{i}").into_bytes();
         assert_eq!(reopened.get(format!("key-{i}").as_bytes()).unwrap(), Some(expected));
@@ -193,7 +193,7 @@ fn delete_in_later_segment_overrides_put_in_earlier_segment() {
     assert_eq!(engine.get(b"k").unwrap(), None);
     drop(engine);
 
-    let mut reopened = Engine::open_with_max_segment_size(path, 64).unwrap();
+    let reopened = Engine::open_with_max_segment_size(path, 64).unwrap();
     assert_eq!(reopened.get(b"k").unwrap(), None);
 }
 
@@ -211,7 +211,7 @@ fn delete_then_get_returns_none() {
 #[test]
 fn get_missing_key_returns_none() {
     let dir = tempfile::tempdir().unwrap();
-    let mut engine = Engine::open(dir.path()).unwrap();
+    let engine = Engine::open(dir.path()).unwrap();
 
     assert_eq!(engine.get(b"never put").unwrap(), None);
 }
@@ -321,7 +321,7 @@ fn reopen_after_compaction_uses_hint_and_matches_full_scan() {
 
     // Reopen normally: this exercises the hint-file fast path for whatever
     // segment(s) compaction produced.
-    let mut reopened = Engine::open_with_max_segment_size(path, 256).unwrap();
+    let reopened = Engine::open_with_max_segment_size(path, 256).unwrap();
     for key_idx in 0..20u32 {
         let key = format!("key-{key_idx}").into_bytes();
         let expected = format!("value-49-{key_idx}").into_bytes();
@@ -337,7 +337,7 @@ fn reopen_after_compaction_uses_hint_and_matches_full_scan() {
             std::fs::remove_file(entry.path()).unwrap();
         }
     }
-    let mut scanned = Engine::open_with_max_segment_size(path, 256).unwrap();
+    let scanned = Engine::open_with_max_segment_size(path, 256).unwrap();
     for key_idx in 0..20u32 {
         let key = format!("key-{key_idx}").into_bytes();
         let expected = format!("value-49-{key_idx}").into_bytes();
@@ -361,7 +361,7 @@ fn compact_does_not_resurrect_deleted_keys() {
     assert_eq!(engine.get(b"k").unwrap(), None);
 
     drop(engine);
-    let mut reopened = Engine::open_with_max_segment_size(path, 64).unwrap();
+    let reopened = Engine::open_with_max_segment_size(path, 64).unwrap();
     assert_eq!(reopened.get(b"k").unwrap(), None);
 }
 
@@ -413,7 +413,7 @@ fn reopen_after_torn_tail_recovers_prior_records() {
     let path = segment_path(dir.path(), 0);
     truncate_to(&path, file_len(&path) - 1);
 
-    let mut engine = Engine::open(dir.path()).unwrap();
+    let engine = Engine::open(dir.path()).unwrap();
     assert_eq!(engine.get(b"a").unwrap(), Some(b"1".to_vec()));
     assert_eq!(engine.get(b"b").unwrap(), None, "torn record must not be resurrected");
 }
@@ -433,7 +433,7 @@ fn every_truncation_offset_in_the_final_record_recovers() {
         let intact_len = file_len(&path) - (21 + 1 + 2);
         truncate_to(&path, file_len(&path) - cut as u64);
 
-        let mut engine = Engine::open(dir.path()).unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
         assert_eq!(engine.get(b"a").unwrap(), Some(b"11".to_vec()), "cut={cut}");
         assert_eq!(engine.get(b"b").unwrap(), None, "cut={cut}");
         assert_eq!(file_len(&path), intact_len, "torn tail must be truncated away, cut={cut}");
@@ -457,7 +457,7 @@ fn write_after_torn_tail_recovery_survives_reopen() {
         engine.put(b"c", b"3").unwrap();
     }
 
-    let mut engine = Engine::open(dir.path()).unwrap();
+    let engine = Engine::open(dir.path()).unwrap();
     assert_eq!(engine.get(b"a").unwrap(), Some(b"1".to_vec()));
     assert_eq!(engine.get(b"c").unwrap(), Some(b"3".to_vec()));
 }
@@ -477,7 +477,7 @@ fn torn_tombstone_leaves_the_key_present() {
     // The delete never became durable, so the key must still be there. A
     // half-written tombstone taking effect would be the engine inventing a
     // deletion the caller was never told had succeeded.
-    let mut engine = Engine::open(dir.path()).unwrap();
+    let engine = Engine::open(dir.path()).unwrap();
     assert_eq!(engine.get(b"a").unwrap(), Some(b"1".to_vec()));
 }
 
@@ -496,7 +496,7 @@ fn corrupt_byte_in_final_record_is_treated_as_a_torn_tail() {
     bytes[last] ^= 0xff;
     std::fs::write(&path, &bytes).unwrap();
 
-    let mut engine = Engine::open(dir.path()).unwrap();
+    let engine = Engine::open(dir.path()).unwrap();
     assert_eq!(engine.get(b"a").unwrap(), Some(b"1".to_vec()));
     assert_eq!(engine.get(b"b").unwrap(), None);
 }
@@ -515,7 +515,7 @@ fn trailing_garbage_is_truncated_away() {
     std::io::Write::write_all(&mut file, &[0xde, 0xad, 0xbe, 0xef]).unwrap();
     drop(file);
 
-    let mut engine = Engine::open(dir.path()).unwrap();
+    let engine = Engine::open(dir.path()).unwrap();
     assert_eq!(engine.get(b"a").unwrap(), Some(b"1".to_vec()));
     assert_eq!(file_len(&path), intact_len);
 }
@@ -632,7 +632,7 @@ fn crash_after_compaction_commit_point_completes_on_reopen() {
     };
     write_manifest(dir.path(), &manifest).unwrap();
 
-    let mut engine = Engine::open_with_max_segment_size(dir.path(), 64).unwrap();
+    let engine = Engine::open_with_max_segment_size(dir.path(), 64).unwrap();
     assert_eq!(engine.get(b"k0").unwrap(), Some(b"final".to_vec()));
     for i in 1..5u32 {
         let key = format!("k{i}").into_bytes();
@@ -675,7 +675,7 @@ fn stale_retired_segment_left_by_a_crash_cannot_win_over_the_merge() {
     }
     write_manifest(dir.path(), &manifest).unwrap();
 
-    let mut engine = Engine::open_with_max_segment_size(dir.path(), 64).unwrap();
+    let engine = Engine::open_with_max_segment_size(dir.path(), 64).unwrap();
     assert_eq!(
         engine.get(b"k").unwrap(),
         Some(b"newest".to_vec()),
@@ -696,7 +696,7 @@ fn crash_before_compaction_commit_point_leaves_the_pre_compaction_state() {
     std::fs::write(dir.path().join("00000000000000000000.seg.tmp"), b"garbage").unwrap();
     std::fs::write(dir.path().join("00000000000000000000.hint.tmp"), b"garbage").unwrap();
 
-    let mut engine = Engine::open_with_max_segment_size(dir.path(), 64).unwrap();
+    let engine = Engine::open_with_max_segment_size(dir.path(), 64).unwrap();
     assert_eq!(engine.get(b"k").unwrap(), Some(b"v7".to_vec()));
     assert!(!dir.path().join("00000000000000000000.seg.tmp").exists(), "orphans cleared");
     assert!(!dir.path().join("00000000000000000000.hint.tmp").exists(), "orphans cleared");
@@ -720,7 +720,7 @@ fn malformed_hint_file_falls_back_to_full_replay() {
         .expect("compaction writes a hint file");
     std::fs::write(&hint, b"\x00\x01\x02").unwrap();
 
-    let mut engine = Engine::open_with_max_segment_size(dir.path(), 64).unwrap();
+    let engine = Engine::open_with_max_segment_size(dir.path(), 64).unwrap();
     for i in 0..8u32 {
         let key = format!("k{i}").into_bytes();
         assert_eq!(
@@ -762,7 +762,7 @@ proptest::proptest! {
         let len = file_len(&path);
         truncate_to(&path, (len as f64 * cut_fraction) as u64);
 
-        let mut engine = Engine::open(dir.path()).unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
         let mut recovered = std::collections::BTreeMap::new();
         for op in &ops {
             let key = match op { Op::Put(k, _) | Op::Delete(k) => k };
@@ -857,8 +857,163 @@ fn data_is_still_correct_under_every_policy() {
             engine.delete(b"k7").unwrap();
         }
 
-        let mut engine = Engine::open_with_config(dir.path(), config).unwrap();
+        let engine = Engine::open_with_config(dir.path(), config).unwrap();
         assert_eq!(engine.get(b"k7").unwrap(), None, "policy: {policy:?}");
         assert_eq!(engine.get(b"k8").unwrap(), Some(b"v8".to_vec()), "policy: {policy:?}");
     }
+}
+
+/// Many threads read one engine at once, with no lock and no coordination —
+/// through a [`crate::ReadView`] each.
+///
+/// `read_value_at` used to `seek` then `read_exact`, and a seek mutates the
+/// file's shared cursor — which is the only reason `get` ever needed
+/// `&mut self`. With `read_at` (pread) the offset travels with the call, so
+/// concurrent readers cannot move each other's cursor.
+///
+/// Until M11.5 this test shared `&Engine` itself. It cannot any more, and the
+/// reason is the milestone: a left-right `ReadHandle` is `!Sync`, so `Engine`
+/// is `Send` but no longer `Sync`. That is not a regression in what can be
+/// done concurrently — it is the type system insisting that each reader mint
+/// its own handle, which is what makes the reads wait-free rather than merely
+/// lock-free. `Engine::get` is now the owner's read; `ReadView::get` is
+/// everyone else's.
+#[test]
+fn many_threads_read_one_engine_concurrently() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::open(dir.path()).unwrap();
+    for i in 0..200u32 {
+        engine.put(format!("k{i}").as_bytes(), format!("v{i}").as_bytes()).unwrap();
+    }
+    assert!(engine.publish(), "nothing is reading yet, so the swap cannot be deferred");
+
+    let factory = engine.read_view_factory();
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            let factory = factory.clone();
+            scope.spawn(move || {
+                let view = factory.view();
+                for i in 0..200u32 {
+                    let got = view.get(format!("k{i}").as_bytes()).unwrap();
+                    assert_eq!(got, Some(format!("v{i}").into_bytes()), "key k{i}");
+                }
+            });
+        }
+    });
+}
+
+/// A reader keeps reading while the writer applies — the property the whole
+/// milestone is for. The writer is not blocked by the readers and the readers
+/// are not blocked by the writer; what a reader sees is whatever the last
+/// `publish` made visible, never a torn or half-applied map.
+#[test]
+fn readers_run_while_the_writer_applies() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::open(dir.path()).unwrap();
+    engine.put(b"stable", b"v").unwrap();
+    engine.publish();
+
+    let factory = engine.read_view_factory();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    std::thread::scope(|scope| {
+        for _ in 0..4 {
+            let factory = factory.clone();
+            let stop = std::sync::Arc::clone(&stop);
+            scope.spawn(move || {
+                let view = factory.view();
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    // Never absent: "stable" was published before the readers
+                    // started and is never written again.
+                    assert_eq!(view.get(b"stable").unwrap(), Some(b"v".to_vec()));
+                }
+            });
+        }
+
+        for i in 0..500u32 {
+            engine.put(format!("k{i}").as_bytes(), b"v").unwrap();
+            engine.publish();
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+
+    // Whatever the readers were doing, the writer's own view is complete.
+    assert_eq!(engine.get(b"k499").unwrap(), Some(b"v".to_vec()));
+}
+
+/// A resolved read can leave the thread that owns the engine.
+///
+/// `locate` does the keydir lookup — in memory, on the single owner — and
+/// hands back everything the actual disk read needs: the location plus a
+/// snapshot of the open segment handles. The owner may then keep writing,
+/// rotating, even compacting, while that read happens elsewhere. No lock is
+/// involved: the keydir never crosses the boundary, and the segment map is
+/// shared immutably and rebuilt copy-on-write when it changes.
+#[test]
+fn a_located_value_reads_from_another_thread_while_the_owner_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    // Small segments so the writes below force several rotations.
+    let mut engine = Engine::open_with_max_segment_size(dir.path(), 128).unwrap();
+    engine.put(b"k", b"v0").unwrap();
+
+    let located = engine.locate(b"k").expect("k is live");
+    let reader = std::thread::spawn(move || located.read().unwrap());
+
+    for i in 0..50u32 {
+        engine.put(format!("other{i}").as_bytes(), b"padding-that-forces-rotation").unwrap();
+    }
+
+    assert_eq!(reader.join().unwrap(), b"v0".to_vec(), "the snapshot still resolves the value");
+    assert_eq!(engine.get(b"k").unwrap(), Some(b"v0".to_vec()), "and the owner agrees");
+}
+
+/// Compaction unlinks the segment a reader is holding. On Unix the inode
+/// outlives the directory entry for as long as an fd refers to it, so a read
+/// resolved before the merge still returns the right bytes rather than
+/// failing. That is what makes the snapshot safe to hand out without
+/// coordinating with compaction.
+#[test]
+fn a_located_value_survives_compaction_deleting_its_segment() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::open_with_max_segment_size(dir.path(), 64).unwrap();
+    engine.put(b"k", b"v0").unwrap();
+    // Force the segment holding "k" closed so compaction is willing to retire it.
+    for i in 0..20u32 {
+        engine.put(format!("filler{i}").as_bytes(), b"xxxxxxxxxxxxxxxx").unwrap();
+    }
+
+    let located = engine.locate(b"k").expect("k is live");
+    engine.compact().unwrap();
+
+    assert_eq!(located.read().unwrap(), b"v0".to_vec(), "an unlinked segment still reads");
+    assert_eq!(engine.get(b"k").unwrap(), Some(b"v0".to_vec()), "and the merged copy agrees");
+}
+
+/// An external I/O engine must be able to perform the read itself — that is
+/// what lets `io_uring` submit it instead of a thread blocking on it. The
+/// `ValueRef` supplies the descriptor, offset and length, and turns the bytes
+/// that come back into the record's value.
+///
+/// The `ValueRef` must outlive the submission: it holds the segment map alive,
+/// and that is what keeps the descriptor open while a read is in flight.
+#[test]
+fn a_located_value_can_be_read_through_its_raw_descriptor() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::open(dir.path()).unwrap();
+    engine.put(b"k", b"v0").unwrap();
+
+    let located = engine.locate(b"k").expect("k is live");
+
+    // Exactly what an io_uring read submission does: pread at (fd, off, len).
+    let mut buf = vec![0u8; located.len()];
+    let read = unsafe {
+        libc::pread(
+            located.raw_fd(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            located.offset() as libc::off_t,
+        )
+    };
+    assert_eq!(read, buf.len() as isize, "pread through the exposed descriptor");
+
+    assert_eq!(located.decode(&buf).unwrap(), b"v0".to_vec());
 }

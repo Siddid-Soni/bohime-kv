@@ -15,8 +15,9 @@
 //! `#[test]` per requirement, so a failure names the requirement that broke
 //! instead of reporting a single opaque suite failure.
 
+use crate::membership::ClusterConfig;
 use crate::storage::RaftStorage;
-use crate::types::{Entry, HardState, LogIndex, Term};
+use crate::types::{Entry, HardState, LogIndex, Snapshot, Term};
 
 pub trait StorageHarness {
     type Storage: RaftStorage;
@@ -100,6 +101,65 @@ pub fn log_survives_reopen<H: StorageHarness>(h: &mut H) {
     assert_eq!(s.term(50).unwrap(), Some(6));
 }
 
+pub fn snapshot_persists_and_term_covers_the_boundary<H: StorageHarness>(h: &mut H) {
+    let mut s = h.create();
+    s.append(&[entry(1, 1), entry(2, 1), entry(3, 2)]).unwrap();
+
+    let snap = Snapshot {
+        last_included_index: 2,
+        last_included_term: 1,
+        data: vec![7; 8],
+        config: ClusterConfig::default(),
+    };
+    s.save_snapshot(&snap).unwrap();
+    assert_eq!(s.snapshot().unwrap(), Some(snap.clone()));
+
+    s.truncate_prefix(2).unwrap();
+    assert_eq!(s.first_index().unwrap(), 3);
+    assert_eq!(s.term(2).unwrap(), Some(1), "boundary term survives its prefix");
+    assert_eq!(s.term(1).unwrap(), None, "below the snapshot the log is gone");
+    assert_eq!(s.snapshot().unwrap(), Some(snap));
+}
+
+pub fn append_continues_after_a_fully_compacted_prefix<H: StorageHarness>(h: &mut H) {
+    let mut s = h.create();
+    s.append(&[entry(1, 1), entry(2, 1)]).unwrap();
+    s.save_snapshot(&Snapshot {
+        last_included_index: 2,
+        last_included_term: 1,
+        data: vec![],
+        config: ClusterConfig::default(),
+    })
+    .unwrap();
+    s.truncate_prefix(2).unwrap();
+
+    assert_eq!(s.last_index().unwrap(), 2);
+    assert_eq!(s.first_index().unwrap(), 3);
+    s.append(&[entry(3, 1)]).unwrap();
+    assert_eq!(s.entries(1, 10).unwrap(), vec![entry(3, 1)]);
+}
+
+pub fn snapshot_and_truncation_survive_reopen<H: StorageHarness>(h: &mut H) {
+    let mut s = h.create();
+    s.append(&(1..=10).map(|i| entry(i, 1)).collect::<Vec<_>>()).unwrap();
+    let snap = Snapshot {
+        last_included_index: 7,
+        last_included_term: 1,
+        data: vec![9; 4],
+        config: ClusterConfig::default(),
+    };
+    s.save_snapshot(&snap).unwrap();
+    s.truncate_prefix(7).unwrap();
+
+    let s = h.reopen(s);
+    assert_eq!(s.snapshot().unwrap(), Some(snap));
+    assert_eq!(s.first_index().unwrap(), 8);
+    assert_eq!(s.last_index().unwrap(), 10);
+    assert_eq!(s.term(7).unwrap(), Some(1));
+    assert_eq!(s.term(6).unwrap(), None);
+    assert_eq!(s.entries(1, 11).unwrap().len(), 3);
+}
+
 pub fn truncation_survives_reopen<H: StorageHarness>(h: &mut H) {
     let mut s = h.create();
     s.append(&(1..=20).map(|i| entry(i, 1)).collect::<Vec<_>>()).unwrap();
@@ -164,6 +224,21 @@ macro_rules! raft_storage_conformance {
             #[test]
             fn truncation_survives_reopen() {
                 $crate::conformance::truncation_survives_reopen(&mut $harness);
+            }
+
+            #[test]
+            fn snapshot_persists_and_term_covers_the_boundary() {
+                $crate::conformance::snapshot_persists_and_term_covers_the_boundary(&mut $harness);
+            }
+
+            #[test]
+            fn append_continues_after_a_fully_compacted_prefix() {
+                $crate::conformance::append_continues_after_a_fully_compacted_prefix(&mut $harness);
+            }
+
+            #[test]
+            fn snapshot_and_truncation_survive_reopen() {
+                $crate::conformance::snapshot_and_truncation_survive_reopen(&mut $harness);
             }
         }
     };

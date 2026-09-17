@@ -11,7 +11,14 @@ use crate::storage::MemStorage;
 use crate::types::{LogIndex, NodeId};
 
 fn config(id: NodeId) -> Config {
-    Config { id, peers: vec![2, 3], election_timeout: 10, heartbeat_interval: 2, seed: id }
+    Config {
+        id,
+        peers: vec![2, 3],
+        election_timeout: 10,
+        heartbeat_interval: 2,
+        seed: id,
+        initial_learner: false,
+    }
 }
 
 /// A node that has won an election. Its no-op is in the log at index 1 but is
@@ -162,4 +169,79 @@ fn stepping_down_drops_outstanding_reads() {
 
     ack(&mut node, 2, 1, Some(round));
     assert!(node.ready().read_states.is_empty(), "a deposed leader confirms nothing");
+}
+
+/// Concurrent readers must share a round rather than cancel each other.
+///
+/// Each `read_index` used to bump `read_round` and clear `round_acks`, so a
+/// second client's read discarded the confirmation the first was waiting on.
+/// The first read is still *safe* — it simply never confirms on the evidence
+/// that was already on its way back. Under continuous read arrival no round
+/// survives long enough to reach quorum and reads starve until a lull.
+#[test]
+fn a_second_read_does_not_discard_the_first_rounds_acks() {
+    let mut node = caught_up_leader();
+
+    assert_eq!(node.read_index(7), Ok(()));
+    let round = round_in_flight(&mut node).expect("the first read broadcasts a stamped heartbeat");
+
+    // A second client reads while that round is still in flight.
+    assert_eq!(node.read_index(8), Ok(()));
+
+    // The peer answers the round that was already outstanding. That ack was
+    // sent after read 7 was requested, so it proves this node still led at a
+    // moment after the read arrived — which is exactly what read 7 needs.
+    ack(&mut node, 2, 1, Some(round));
+
+    let tokens: Vec<u64> = node.ready().read_states.iter().map(|r| r.token).collect();
+    assert_eq!(tokens, vec![7], "the round's ack must still confirm the read that opened it");
+}
+
+/// The batching property. Reads arriving while a round is outstanding wait for
+/// the *next* round and share it, so a burst of readers costs one extra round
+/// rather than one round each.
+///
+/// They cannot join the outstanding round: it was broadcast before they
+/// arrived, so its acks say nothing about leadership at their request time.
+#[test]
+fn reads_arriving_during_a_round_share_the_next_one() {
+    let mut node = caught_up_leader();
+
+    assert_eq!(node.read_index(7), Ok(()));
+    let first = round_in_flight(&mut node).expect("a stamped heartbeat");
+
+    // Three more clients read before the first round comes back.
+    for token in [8, 9, 10] {
+        assert_eq!(node.read_index(token), Ok(()));
+    }
+    assert!(
+        node.ready().messages.is_empty(),
+        "a read arriving during a round must not broadcast a round of its own"
+    );
+
+    // Confirming the first round releases read 7 and opens exactly one more
+    // round for the three queued behind it.
+    ack(&mut node, 2, 1, Some(first));
+    let ready = node.ready();
+    assert_eq!(
+        ready.read_states.iter().map(|r| r.token).collect::<Vec<_>>(),
+        vec![7],
+        "only the read that opened the round is confirmed by it"
+    );
+    let second = ready
+        .messages
+        .iter()
+        .rev()
+        .find_map(|(_, msg)| match msg {
+            Message::AppendEntries { read_round, .. } => Some(*read_round),
+            _ => None,
+        })
+        .flatten()
+        .expect("the queued reads open one shared round");
+    assert_ne!(second, first, "the queued reads need a round broadcast after they arrived");
+
+    ack(&mut node, 2, 1, Some(second));
+    let mut tokens: Vec<u64> = node.ready().read_states.iter().map(|r| r.token).collect();
+    tokens.sort_unstable();
+    assert_eq!(tokens, vec![8, 9, 10], "all three confirm on the one shared round");
 }

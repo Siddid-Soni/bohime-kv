@@ -1,12 +1,27 @@
 pub(crate) mod cluster;
+pub(crate) mod support;
 
 mod command;
 mod config;
 mod convert;
 mod driver;
 mod end_to_end;
+mod group;
 mod linearizability;
+mod map_read;
+mod membership;
+mod meta;
+mod multi_raft;
+mod placement;
+mod read_engine;
+mod rebalance;
+mod ring;
+mod router;
 mod session;
+mod shard_map;
+mod shards;
+mod snapshot;
 mod storage;
 mod storage_equivalence;
 mod transport;
+mod wait_free_reads;

@@ -10,12 +10,13 @@ use rand::{Rng, SeedableRng};
 
 use crate::election::{CandidateInfo, VoterState, should_grant_vote};
 use crate::log::{Consistency, check_consistency, last_log};
+use crate::membership::{ClusterConfig, ConfChange, ConfProposeError, decode_conf, encode_conf};
 use crate::message::{
     Action, Config, Message, ProposeError, ReadIndexError, ReadState, Ready, Role,
 };
 use crate::replication::backtrack;
 use crate::storage::RaftStorage;
-use crate::types::{Entry, HardState, LogIndex, NodeId, Term};
+use crate::types::{Entry, HardState, LogIndex, NodeId, Snapshot, Term};
 
 /// The fields of an `AppendEntriesResp`, passed as one value rather than as
 /// seven positional arguments where transposing two of the `Option<u64>`s
@@ -29,8 +30,28 @@ struct AppendResponse {
     read_round: Option<u64>,
 }
 
+/// The fields of an `InstallSnapshot`, for the same reason: eight positional
+/// arguments with three `u64`s in a row is a transposition waiting to happen.
+struct SnapshotInstall {
+    msg_term: Term,
+    leader_id: NodeId,
+    last_included_index: LogIndex,
+    last_included_term: Term,
+    data: Vec<u8>,
+    config: ClusterConfig,
+}
+
 pub struct RaftNode<S: RaftStorage> {
     config: Config,
+    /// The live membership (M9). Starts as all of `config.peers` voting, then
+    /// moves exclusively through conf log entries — never through flags or
+    /// restarts. Every quorum, fan-out, and eligibility check reads this, not
+    /// `config.peers`.
+    cluster: ClusterConfig,
+    /// The conf entry currently replicating, if any. At most one change is
+    /// uncommitted at a time (single-server rule); proposing another is an
+    /// error, not a queue.
+    pending_conf: Option<LogIndex>,
     role: Role,
     current_term: Term,
     voted_for: Option<NodeId>,
@@ -51,11 +72,22 @@ pub struct RaftNode<S: RaftStorage> {
     /// ReadIndex (M7), leader-only. `read_round` stamps outbound heartbeats so
     /// an ack can be attributed to the round that carried it; `round_acks`
     /// collects the peers that echoed the *current* round; `pending_reads`
-    /// holds `(token, index)` until a quorum confirms. All three are cleared
-    /// on any role change — evidence of leadership does not survive losing it.
+    /// holds `(token, index)` until a quorum confirms. All are cleared on any
+    /// role change — evidence of leadership does not survive losing it.
     read_round: u64,
     round_acks: BTreeSet<NodeId>,
     pending_reads: Vec<(u64, LogIndex)>,
+    /// Set by `propose`, cleared by any broadcast. Defers replication to the
+    /// next `ready()` so concurrent writers share one AppendEntries per peer.
+    replication_pending: bool,
+    /// Reads that arrived while a round was already outstanding. They cannot
+    /// join it — it was broadcast before they existed, so its acks say nothing
+    /// about leadership at *their* request time — so they wait and share the
+    /// next one. This is what keeps a burst of readers costing one extra round
+    /// rather than one round each: before it, every read bumped `read_round`
+    /// and cleared `round_acks`, discarding the confirmation the previous
+    /// reader was waiting on, and a steady read rate starved every round.
+    queued_reads: Vec<(u64, LogIndex)>,
     /// Reads whose quorum has been confirmed, waiting to be drained by
     /// `ready()`. Kept apart from the `Action` outbox because a read is not
     /// work for the caller to perform — it is an answer.
@@ -63,6 +95,10 @@ pub struct RaftNode<S: RaftStorage> {
     /// Last log index covered by the most recent `AppendEntries` sent to each
     /// peer. Lets a success response advance `match_index` without changing
     /// the response shape (the leader knows what it sent).
+    /// The snapshot index last shipped to each peer (M8). An
+    /// `InstallSnapshotResp` carries no index, so the leader remembers what it
+    /// sent to advance `next_index`/`match_index` on success.
+    sent_snapshot: BTreeMap<NodeId, LogIndex>,
     storage: S,
     rng: StdRng,
     outbox: Vec<Action>,
@@ -73,8 +109,24 @@ impl<S: RaftStorage> RaftNode<S> {
         let hs: HardState = storage.hard_state().expect("raft storage");
         let mut rng = StdRng::seed_from_u64(config.seed);
         let election_timeout = random_timeout(&mut rng, config.election_timeout);
-        Self {
+        // The log is the source of truth for membership (M9): start from the
+        // snapshot's config for the compacted prefix, then replay conf entries
+        // in the live tail. A restart with different flags cannot change the
+        // quorum out from under committed entries.
+        //
+        // The bootstrap config only matters on a genuinely fresh store (no
+        // snapshot, empty log): a founding voter joins the voters, a joining
+        // learner starts learning. After that the log owns the membership and
+        // the flags are history.
+        let cluster = storage
+            .snapshot()
+            .expect("raft storage")
+            .map(|s| s.config)
+            .unwrap_or_else(|| initial_cluster(&config));
+        let mut node = Self {
             config,
+            cluster,
+            pending_conf: None,
             role: Role::Follower,
             current_term: hs.term,
             voted_for: hs.voted_for,
@@ -90,11 +142,17 @@ impl<S: RaftStorage> RaftNode<S> {
             read_round: 0,
             round_acks: BTreeSet::new(),
             pending_reads: Vec::new(),
+            queued_reads: Vec::new(),
+            replication_pending: false,
             confirmed_reads: Vec::new(),
+            sent_snapshot: BTreeMap::new(),
             storage,
             rng,
             outbox: Vec::new(),
-        }
+        };
+        let first = node.storage.first_index().expect("raft storage");
+        node.replay_conf(first);
+        node
     }
 
     pub fn role(&self) -> Role {
@@ -103,6 +161,32 @@ impl<S: RaftStorage> RaftNode<S> {
 
     pub fn id(&self) -> NodeId {
         self.config.id
+    }
+
+    /// The live membership. The driver reads this to reconcile its peer
+    /// connections and to stamp snapshots; it changes only through conf log
+    /// entries, never through this handle.
+    pub fn cluster_config(&self) -> &ClusterConfig {
+        &self.cluster
+    }
+
+    /// Voter quorum of the live membership — the only denominator any commit,
+    /// election, or read rule may use.
+    fn quorum(&self) -> usize {
+        self.cluster.quorum()
+    }
+
+    /// Every node this node replicates to and hears from: voters plus
+    /// learners. Learners get entries, heartbeats, and snapshots; they just
+    /// never count.
+    fn replication_targets(&self) -> Vec<NodeId> {
+        self.cluster
+            .voters
+            .iter()
+            .chain(self.cluster.learners.iter())
+            .copied()
+            .filter(|p| *p != self.config.id)
+            .collect()
     }
 
     pub fn current_term(&self) -> Term {
@@ -144,9 +228,14 @@ impl<S: RaftStorage> RaftNode<S> {
                 self.heartbeat_elapsed = 0;
                 self.broadcast_heartbeats();
             }
+            // Whatever a heartbeat on this tick did not already carry. `tick`
+            // and `ready` drain the same queue, so a deferred proposal has to
+            // surface in either — the test harness uses only this one.
+            self.flush_replication();
             return self.new_actions_since(checkpoint);
         }
 
+        self.flush_replication();
         self.election_elapsed += 1;
         if self.election_elapsed >= self.election_timeout {
             self.start_election();
@@ -162,6 +251,52 @@ impl<S: RaftStorage> RaftNode<S> {
     /// `ready()`: consume one interface or the other, not both.
     pub fn step(&mut self, from: NodeId, msg: Message) -> Vec<Action> {
         let checkpoint = self.outbox.len();
+        // Before the message is handled, matching the old immediate broadcast:
+        // a proposal accepted while we still led goes out under the term we
+        // held then, whatever this message does to that.
+        self.flush_replication();
+        // A removed node (or a process that was never a member) must not be
+        // able to depose a healthy leader by waving a high term — §1.7's
+        // disruptive-server problem. So a **campaign** from outside the
+        // membership is dropped before the term rules run, not after: it must
+        // not force a step-down, reset an election timer, or win a vote.
+        //
+        // The gate is about votes and nothing else, and that boundary is
+        // load-bearing in both directions:
+        //
+        // - Replication from an unknown sender is *accepted*. A node admitted
+        //   to a running cluster starts knowing nobody — its membership lives
+        //   in a log it has not received yet — so the leader catching it up is
+        //   a stranger by its own reckoning. Dropping those messages makes the
+        //   join impossible, since they are the only way the membership ever
+        //   arrives. Safety is untouched: `AppendEntries` is accepted only on
+        //   a matching log prefix, and election safety already says nobody
+        //   holds a term they did not win a quorum for.
+        // - A removed leader's handoff arrives from outside the membership by
+        //   construction — it was just removed — so an equal-term `TimeoutNow`
+        //   is honoured. The exact term match is its authenticity, and all it
+        //   can trigger is a campaign by a voter of this node's own cluster.
+        //   A stale one, or a future term no legitimate handoff carries, falls
+        //   through to the gate.
+        let vote_traffic = match &msg {
+            // A campaign, and the answers to one. Exactly what a node outside
+            // the membership must not be able to start or decide.
+            Message::RequestVote { .. } | Message::RequestVoteResp { .. } => true,
+            // A handoff at our exact term is authentic by construction;
+            // anything else claiming to be one is not.
+            Message::TimeoutNow { term, .. } => *term != self.current_term,
+            // Replication, snapshots, and their answers.
+            _ => false,
+        };
+        if vote_traffic && !self.cluster.contains(from) {
+            return self.new_actions_since(checkpoint);
+        }
+        if let Message::TimeoutNow { term: handoff_term, .. } = &msg
+            && *handoff_term == self.current_term
+        {
+            self.handle_timeout_now(from, *handoff_term);
+            return self.new_actions_since(checkpoint);
+        }
         let term = msg.term();
         if term > self.current_term {
             self.observe_higher_term(term);
@@ -244,9 +379,36 @@ impl<S: RaftStorage> RaftNode<S> {
                     },
                 );
             }
-            Message::InstallSnapshot { .. } | Message::InstallSnapshotResp { .. } => {
-                // Snapshots at M8.
+            Message::InstallSnapshot {
+                term: msg_term,
+                leader_id,
+                last_included_index,
+                last_included_term,
+                data,
+                config,
+            } => {
+                self.handle_install_snapshot(
+                    from,
+                    SnapshotInstall {
+                        msg_term,
+                        leader_id,
+                        last_included_index,
+                        last_included_term,
+                        data,
+                        config,
+                    },
+                );
             }
+            Message::InstallSnapshotResp { term: resp_term, success } => {
+                self.handle_install_snapshot_resp(from, resp_term, success);
+            }
+            Message::TimeoutNow { term: msg_term, .. } => {
+                self.handle_timeout_now(from, msg_term);
+            }
+            // A transport ack, not a protocol message: nothing to do. (It
+            // arrives here only in tests that step every message; the driver
+            // consumes RPC responses through the reply channel instead.)
+            Message::TimeoutNowResp { .. } => {}
         }
         self.new_actions_since(checkpoint)
     }
@@ -261,11 +423,47 @@ impl<S: RaftStorage> RaftNode<S> {
         let (last_index, _) = last_log(&self.storage);
         let index = last_index + 1;
         self.persist_entries(vec![Entry { term: self.current_term, index, command: cmd }]);
-        for peer in self.config.peers.clone() {
-            self.send_append(peer);
-        }
+        // Replication is deferred to `ready()` rather than broadcast here, so
+        // a burst of proposals ships one AppendEntries per peer instead of one
+        // per proposal. `send_append` always sends from `next_index`, so the
+        // flush carries everything that accumulated — the immediate broadcasts
+        // were each a superset of the one before, and only the last mattered.
+        //
+        // Nothing waits on the flush: a proposal that never meets a `ready()`
+        // still goes out on the next heartbeat, from `next_index` as always.
+        self.replication_pending = true;
         // Same reason as `become_leader`: a group of one has already reached
         // quorum the moment the entry is on its own disk.
+        self.try_advance_commit();
+        Ok(index)
+    }
+
+    /// Appends a membership change to the log (M9). Only the leader accepts
+    /// them, at most one goes uncommitted at a time, and the change takes
+    /// effect on append — the entry commits under the *new* config. The
+    /// driver routes these from the admin path, never from client writes.
+    pub fn propose_conf_change(
+        &mut self,
+        change: ConfChange,
+    ) -> Result<LogIndex, ConfProposeError> {
+        if self.role != Role::Leader {
+            return Err(ConfProposeError::NotLeader);
+        }
+        if self.pending_conf.is_some_and(|i| i > self.commit_index) {
+            return Err(ConfProposeError::ConfInFlight);
+        }
+        // Dry-run first: an invalid change is refused before it touches the
+        // log, so the log never carries a conf entry every replica would have
+        // to agree to ignore.
+        self.cluster.apply(&change)?;
+        let (last_index, _) = last_log(&self.storage);
+        let index = last_index + 1;
+        self.persist_entries(vec![Entry {
+            term: self.current_term,
+            index,
+            command: encode_conf(&change),
+        }]);
+        self.replication_pending = true;
         self.try_advance_commit();
         Ok(index)
     }
@@ -292,15 +490,18 @@ impl<S: RaftStorage> RaftNode<S> {
             return Err(ReadIndexError::NoQuorumInTerm);
         }
 
-        self.pending_reads.push((token, self.commit_index));
-        // A fresh round, and no credit carried over from the last one: only
-        // acks to heartbeats sent from here on prove leadership *now*.
-        self.read_round += 1;
-        self.round_acks.clear();
-        self.broadcast_heartbeats();
-        // A group of one is already a quorum; for anything larger this
-        // declines and the peers' acks decide.
-        self.try_confirm_reads();
+        // A round already outstanding is one this read cannot use, but it is
+        // also one it must not cancel. Queue behind it and share the round
+        // that opens when it settles.
+        if self.pending_reads.is_empty() {
+            self.pending_reads.push((token, self.commit_index));
+            self.start_read_round();
+            // A group of one is already a quorum; for anything larger this
+            // declines and the peers' acks decide.
+            self.try_confirm_reads();
+        } else {
+            self.queued_reads.push((token, self.commit_index));
+        }
         Ok(())
     }
 
@@ -308,6 +509,7 @@ impl<S: RaftStorage> RaftNode<S> {
     /// caller: persist entries, persist hard state, send messages, apply
     /// committed — disk before network (§1.5).
     pub fn ready(&mut self) -> Ready {
+        self.flush_replication();
         let mut ready =
             Ready { read_states: std::mem::take(&mut self.confirmed_reads), ..Ready::default() };
         for action in self.outbox.drain(..) {
@@ -322,6 +524,13 @@ impl<S: RaftStorage> RaftNode<S> {
                         ready.committed.extend(entries);
                         self.last_applied = up_to;
                     }
+                }
+                Action::ApplySnapshot(snap) => {
+                    // At most one install per drain; a second would mean two
+                    // snapshots installed without the caller restoring between
+                    // them, which cannot happen — one message, one handler.
+                    debug_assert!(ready.snapshot.is_none());
+                    ready.snapshot = Some(snap);
                 }
             }
         }
@@ -349,6 +558,13 @@ impl<S: RaftStorage> RaftNode<S> {
     }
 
     fn start_election(&mut self) {
+        // Learners never campaign: they hold no vote, count toward no quorum,
+        // and winning would mean leading a group whose majority never chose
+        // them. They wait to be promoted instead.
+        if !self.cluster.is_voter(self.config.id) {
+            self.reset_election_timer();
+            return;
+        }
         self.current_term += 1;
         self.role = Role::Candidate;
         self.voted_for = Some(self.config.id);
@@ -366,11 +582,16 @@ impl<S: RaftStorage> RaftNode<S> {
             last_log_index: last_index,
             last_log_term: last_term,
         };
-        for peer in self.config.peers.clone() {
+        // Voters only: asking a learner is asking someone who must refuse.
+        // Collected first: the send borrows mutably and must not hold the
+        // voter set across it.
+        let voters: Vec<NodeId> =
+            self.cluster.voters.iter().copied().filter(|p| *p != self.config.id).collect();
+        for peer in voters {
             self.send(peer, msg.clone());
         }
 
-        if self.votes_received.len() >= self.config.quorum() {
+        if self.votes_received.len() >= self.quorum() {
             self.become_leader();
         }
     }
@@ -379,10 +600,11 @@ impl<S: RaftStorage> RaftNode<S> {
         self.role = Role::Leader;
         self.leader_id = Some(self.config.id);
         let (last_index, _) = last_log(&self.storage);
-        for peer in self.config.peers.clone() {
+        for peer in self.replication_targets() {
             self.next_index.insert(peer, last_index + 1);
             self.match_index.insert(peer, 0);
         }
+        self.sent_snapshot.clear();
         self.heartbeat_elapsed = 0;
         // A new leader appends a no-op in its own term. Everything before it
         // becomes committable indirectly (figure-8 rule), and reads can
@@ -402,9 +624,22 @@ impl<S: RaftStorage> RaftNode<S> {
     }
 
     fn broadcast_heartbeats(&mut self) {
-        for peer in self.config.peers.clone() {
+        // A broadcast sends from `next_index` to every peer, so it already
+        // carries whatever `propose` deferred: it *is* the flush.
+        self.replication_pending = false;
+        for peer in self.replication_targets() {
             self.send_append(peer);
         }
+    }
+
+    /// Ships everything proposed since the last broadcast, one AppendEntries
+    /// per peer. A node that lost leadership mid-batch replicates nothing —
+    /// the entries are no longer its to send.
+    fn flush_replication(&mut self) {
+        if self.replication_pending && self.role == Role::Leader {
+            self.broadcast_heartbeats();
+        }
+        self.replication_pending = false;
     }
 
     fn handle_request_vote(
@@ -416,20 +651,25 @@ impl<S: RaftStorage> RaftNode<S> {
         candidate_last_term: Term,
     ) {
         let (voter_last_index, voter_last_term) = last_log(&self.storage);
-        let granted = should_grant_vote(
-            &CandidateInfo {
-                term: candidate_term,
-                id: candidate_id,
-                last_term: candidate_last_term,
-                last_index: candidate_last_index,
-            },
-            &VoterState {
-                current_term: self.current_term,
-                voted_for: self.voted_for,
-                last_term: voter_last_term,
-                last_index: voter_last_index,
-            },
-        );
+        // Membership first, log second: learners never grant (their vote
+        // counts nowhere), and nobody grants a non-voter — a removed node
+        // must not assemble a majority from politeness.
+        let granted = self.cluster.is_voter(self.config.id)
+            && self.cluster.is_voter(candidate_id)
+            && should_grant_vote(
+                &CandidateInfo {
+                    term: candidate_term,
+                    id: candidate_id,
+                    last_term: candidate_last_term,
+                    last_index: candidate_last_index,
+                },
+                &VoterState {
+                    current_term: self.current_term,
+                    voted_for: self.voted_for,
+                    last_term: voter_last_term,
+                    last_index: voter_last_index,
+                },
+            );
         if granted {
             // Persist the vote before responding: a crash between grant and
             // persist would let this node vote twice in one term.
@@ -451,11 +691,32 @@ impl<S: RaftStorage> RaftNode<S> {
             return;
         }
         if granted {
+            // Voters only: a learner's encouragement is not a vote, and a
+            // removed node's is not either. Counting either would elect a
+            // leader no quorum chose.
+            if !self.cluster.is_voter(from) {
+                return;
+            }
             self.votes_received.insert(from);
-            if self.votes_received.len() >= self.config.quorum() {
+            if self.votes_received.len() >= self.quorum() {
                 self.become_leader();
             }
         }
+    }
+
+    /// Campaigns at once on a leader's handoff (M9). Only a voter may take it
+    /// up, and only while not leading — a leader receiving its own handoff
+    /// back (duplicated message) must not depose itself. Answers with a
+    /// transport ack either way: the RPC plumbing needs a response variant,
+    /// and silence would read as a dead peer.
+    fn handle_timeout_now(&mut self, from: NodeId, msg_term: Term) {
+        if msg_term == self.current_term
+            && self.role != Role::Leader
+            && self.cluster.is_voter(self.config.id)
+        {
+            self.start_election();
+        }
+        self.send(from, Message::TimeoutNowResp { term: self.current_term });
     }
 
     /// Follower-side log replication: consistency check, conflict truncation,
@@ -465,12 +726,41 @@ impl<S: RaftStorage> RaftNode<S> {
     fn handle_append_entries(
         &mut self,
         leader_id: NodeId,
-        prev_log_index: LogIndex,
-        prev_log_term: Term,
-        entries: Vec<Entry>,
+        mut prev_log_index: LogIndex,
+        mut prev_log_term: Term,
+        mut entries: Vec<Entry>,
         leader_commit: LogIndex,
         read_round: Option<u64>,
     ) {
+        // The leader has not compacted but we have: everything at or below
+        // our snapshot is settled state, so entries covered by it are already
+        // applied and only the tail beyond it can be new. Rebase onto the
+        // snapshot boundary instead of rejecting on terms we no longer store.
+        let covered_by_snapshot = self
+            .storage
+            .snapshot()
+            .expect("raft storage")
+            .map(|s| s.last_included_index)
+            .unwrap_or(0);
+        let mut covered_floor = 0;
+        if prev_log_index < covered_by_snapshot {
+            let skip = (covered_by_snapshot - prev_log_index) as usize;
+            if skip >= entries.len() {
+                // All covered: confirm through the snapshot, not through the
+                // stale prefix, so the leader's `next_index` jumps past it.
+                covered_floor = covered_by_snapshot;
+            } else {
+                let snap_term = self
+                    .storage
+                    .snapshot()
+                    .expect("raft storage")
+                    .map(|s| s.last_included_term)
+                    .unwrap_or(0);
+                entries = entries[skip..].to_vec();
+                prev_log_index = covered_by_snapshot;
+                prev_log_term = snap_term;
+            }
+        }
         match check_consistency(&self.storage, prev_log_index, prev_log_term) {
             Consistency::Mismatch { conflict_term, conflict_index } => {
                 self.send(
@@ -501,7 +791,10 @@ impl<S: RaftStorage> RaftNode<S> {
         if first_new < entries.len() {
             // §5.3: an existing entry *conflicts* — same index, different term
             // — so delete it and everything after it, then append the rest.
-            self.storage.truncate_suffix(base + first_new as LogIndex).expect("raft storage");
+            // Truncation can drop an uncommitted conf entry, which already
+            // moved the membership on append: the cluster is recomputed from
+            // the surviving prefix so it cannot disagree with the log.
+            self.truncate_suffix(base + first_new as LogIndex);
             self.persist_entries(entries[first_new..].to_vec());
         }
         // Deliberately no `else`. Entries past what this message covers are not
@@ -514,12 +807,15 @@ impl<S: RaftStorage> RaftNode<S> {
         // Clamp to the range this AppendEntries actually confirmed, not to our
         // whole log: a longer tail left over from an older leader carries no
         // commitment from *this* one. Monotonic — commit_index never retreats.
-        let covered = prev_log_index + entries.len() as LogIndex;
+        // When the whole message fell inside our snapshot, the boundary is the
+        // confirmation — it is what the leader must advance past.
+        let covered = (prev_log_index + entries.len() as LogIndex).max(covered_floor);
         let confirmed = leader_commit.min(covered);
         if confirmed > self.commit_index {
             self.commit_index = confirmed;
             self.persist_hard_state();
             self.outbox.push(Action::ApplyEntries { up_to: self.commit_index });
+            self.clear_committed_conf();
         }
 
         self.send(
@@ -555,14 +851,26 @@ impl<S: RaftStorage> RaftNode<S> {
         // counts: one already in flight when the read arrived proves this node
         // led at some earlier instant, and it could have been deposed in
         // between. That is the stale read this whole mechanism removes, and it
-        // is visible only under a partition.
-        if read_round == Some(self.read_round) && !self.pending_reads.is_empty() {
+        // is visible only under a partition. Voters only: a learner's echo is
+        // not leadership evidence any quorum would accept.
+        if read_round == Some(self.read_round)
+            && !self.pending_reads.is_empty()
+            && self.cluster.is_voter(from)
+        {
             self.round_acks.insert(from);
             self.try_confirm_reads();
         }
         if success {
             // Monotonic: a delayed or duplicated reply to an older, shorter
             // AppendEntries must never walk match_index backwards.
+            //
+            // Learners are tracked exactly like voters. A leader that cannot
+            // see how far a learner has got cannot tell when promoting it is
+            // safe, and catch-up-then-promote is the entire reason learners
+            // exist. What must not happen is *counting* a learner toward a
+            // commit — that rule lives in `try_advance_commit`, which sums
+            // voters only, and is where it belongs: one place decides
+            // quorums.
             let matched = self.match_index.get(&from).copied().unwrap_or(0);
             if reported_match > matched {
                 self.match_index.insert(from, reported_match);
@@ -575,6 +883,82 @@ impl<S: RaftStorage> RaftNode<S> {
             self.next_index.insert(from, next.max(1));
             self.send_append(from);
         }
+    }
+
+    /// Follower-side snapshot install (M8). The snapshot is committed state, so
+    /// everything through it is settled: the prefix is dropped, commit and
+    /// last-applied jump to the boundary, and the driver restores its state
+    /// machine from `Ready::snapshot` instead of a stream of entries.
+    fn handle_install_snapshot(&mut self, from: NodeId, install: SnapshotInstall) {
+        let SnapshotInstall {
+            msg_term,
+            leader_id,
+            last_included_index,
+            last_included_term,
+            data,
+            config,
+        } = install;
+        if msg_term < self.current_term {
+            self.send(
+                from,
+                Message::InstallSnapshotResp { term: self.current_term, success: false },
+            );
+            return;
+        }
+        if self.role != Role::Follower {
+            self.role = Role::Follower;
+            self.abandon_reads();
+        }
+        self.leader_id = Some(leader_id);
+        self.reset_election_timer();
+        if last_included_index <= self.commit_index {
+            // Already applied past this: ack so the leader advances, install
+            // nothing.
+            self.send(
+                from,
+                Message::InstallSnapshotResp { term: self.current_term, success: true },
+            );
+            return;
+        }
+        let snap = Snapshot { last_included_index, last_included_term, data, config };
+        self.storage.save_snapshot(&snap).expect("raft storage");
+        self.storage.truncate_prefix(last_included_index).expect("raft storage");
+        self.commit_index = last_included_index;
+        self.last_applied = self.last_applied.max(last_included_index);
+        // The prefix carried the membership with it: restart from the
+        // snapshot's config, then replay the surviving tail. Anything pending
+        // past the boundary becomes pending again in the replay.
+        self.cluster =
+            self.storage.snapshot().expect("raft storage").map(|s| s.config).expect("just saved");
+        self.pending_conf = None;
+        let first = self.storage.first_index().expect("raft storage");
+        self.replay_conf(first);
+        self.persist_hard_state();
+        self.outbox.push(Action::ApplySnapshot(snap));
+        self.send(from, Message::InstallSnapshotResp { term: self.current_term, success: true });
+    }
+
+    /// Leader-side snapshot accounting (M8). The response carries no index,
+    /// so the index recorded when the snapshot went out is what advances
+    /// `match_index`/`next_index` — monotonically, like the append path.
+    fn handle_install_snapshot_resp(&mut self, from: NodeId, resp_term: Term, success: bool) {
+        if self.role != Role::Leader || resp_term != self.current_term {
+            return;
+        }
+        if !success {
+            self.send_append(from);
+            return;
+        }
+        if let Some(sent) = self.sent_snapshot.remove(&from) {
+            let matched = self.match_index.get(&from).copied().unwrap_or(0);
+            if sent > matched && self.cluster.is_voter(from) {
+                self.match_index.insert(from, sent);
+            }
+            let next = self.next_index.get(&from).copied().unwrap_or(1);
+            self.next_index.insert(from, next.max(sent + 1));
+            self.try_advance_commit();
+        }
+        self.send_append(from);
     }
 
     /// Leader commit rule (§1.5): advance to the highest N such that a
@@ -590,12 +974,14 @@ impl<S: RaftStorage> RaftNode<S> {
                 continue;
             }
             let mut count = 1; // the leader holds its whole log
-            for matched in self.match_index.values() {
-                if *matched >= n {
+            for (peer, matched) in self.match_index.iter() {
+                // Voters only: learners replicate but never commit, or adding
+                // a far-behind node would stall the group it was meant to join.
+                if self.cluster.is_voter(*peer) && *matched >= n {
                     count += 1;
                 }
             }
-            if count >= self.config.quorum() {
+            if count >= self.quorum() {
                 target = n;
             }
         }
@@ -603,14 +989,40 @@ impl<S: RaftStorage> RaftNode<S> {
             self.commit_index = target;
             self.persist_hard_state();
             self.outbox.push(Action::ApplyEntries { up_to: target });
+            self.clear_committed_conf();
+            self.step_down_if_removed();
         }
     }
 
     /// Sends one `AppendEntries` covering everything from `next_index[to]`
     /// onward — empty when the follower is caught up, in which case it is a
     /// heartbeat. Records the covered end index for the success path above.
+    ///
+    /// When `next_index[to]` points inside the compacted prefix (M8), there is
+    /// no `prev_log_term` to send — the term is gone with the entries, and
+    /// fabricating a `0` makes the follower reject forever. Sends the snapshot
+    /// covering the prefix instead.
     fn send_append(&mut self, to: NodeId) {
         let next = self.next_index.get(&to).copied().unwrap_or(1);
+        let first = self.storage.first_index().expect("raft storage");
+        if next < first
+            && let Some(snap) = self.storage.snapshot().expect("raft storage")
+        {
+            let index = snap.last_included_index;
+            self.sent_snapshot.insert(to, index);
+            self.send(
+                to,
+                Message::InstallSnapshot {
+                    term: self.current_term,
+                    leader_id: self.config.id,
+                    last_included_index: index,
+                    last_included_term: snap.last_included_term,
+                    data: snap.data.clone(),
+                    config: snap.config.clone(),
+                },
+            );
+            return;
+        }
         let prev = next.saturating_sub(1);
         let prev_term =
             if prev == 0 { 0 } else { self.storage.term(prev).expect("raft storage").unwrap_or(0) };
@@ -646,15 +1058,38 @@ impl<S: RaftStorage> RaftNode<S> {
     /// it is what makes a group of one work. Without calling this from
     /// `read_index` too, a lone leader would wait forever for an ack no peer
     /// will ever send, exactly as the commit rule did before M6.
+    /// A fresh round, and no credit carried over from the last one: only acks
+    /// to heartbeats sent from here on prove leadership *now*. `send_append`
+    /// stamps the round whenever a read is pending, so the periodic heartbeat
+    /// re-carries it and a dropped broadcast recovers on the next tick.
+    fn start_read_round(&mut self) {
+        self.read_round += 1;
+        self.round_acks.clear();
+        self.broadcast_heartbeats();
+    }
+
+    /// Confirms the outstanding round's reads, then opens one round for
+    /// whatever queued behind it. Loops rather than recurses because a
+    /// one-node group reaches quorum inside `start_read_round`'s own call.
     fn try_confirm_reads(&mut self) {
-        if self.pending_reads.is_empty() {
-            return;
-        }
-        if self.round_acks.len() + 1 >= self.config.quorum() {
+        loop {
+            if self.pending_reads.is_empty() {
+                return;
+            }
+            if self.round_acks.len() + 1 < self.config.quorum() {
+                return;
+            }
             for (token, index) in self.pending_reads.drain(..) {
                 self.confirmed_reads.push(ReadState { token, index });
             }
             self.round_acks.clear();
+            if self.queued_reads.is_empty() {
+                return;
+            }
+            // The queued reads all arrived before this round is broadcast, so
+            // its acks prove leadership after every one of them was requested.
+            self.pending_reads.append(&mut self.queued_reads);
+            self.start_read_round();
         }
     }
 
@@ -663,6 +1098,7 @@ impl<S: RaftStorage> RaftNode<S> {
     /// once we no longer lead.
     fn abandon_reads(&mut self) {
         self.pending_reads.clear();
+        self.queued_reads.clear();
         self.round_acks.clear();
     }
 
@@ -686,12 +1122,149 @@ impl<S: RaftStorage> RaftNode<S> {
             return;
         }
         self.storage.append(&entries).expect("raft storage");
+        // A conf entry takes effect the moment it is appended — on the leader
+        // that proposed it and on every follower that stores it — not when it
+        // commits (§1.7). Hooking the single append choke point covers propose,
+        // replication, and re-append after conflict truncation uniformly.
+        for entry in &entries {
+            if let Some(change) = decode_conf(&entry.command) {
+                self.apply_conf_appended(entry.index, &change);
+            }
+        }
         self.outbox.push(Action::PersistEntries(entries));
+    }
+
+    /// Discards the log suffix at `from` and recomputes the membership from
+    /// the surviving prefix: truncation can drop an uncommitted conf entry
+    /// that already moved the cluster on append, and the cluster must never
+    /// disagree with the log it describes.
+    fn truncate_suffix(&mut self, from: LogIndex) {
+        self.storage.truncate_suffix(from).expect("raft storage");
+        let base = self
+            .storage
+            .snapshot()
+            .expect("raft storage")
+            .map(|s| s.config)
+            .unwrap_or_else(|| initial_cluster(&self.config));
+        self.cluster = base;
+        self.pending_conf = None;
+        let first = self.storage.first_index().expect("raft storage");
+        if from > first {
+            self.replay_conf(first);
+        }
+    }
+
+    /// Applies one appended conf entry to the live membership and tracks it
+    /// as the uncommitted change. A malformed entry (one no valid proposal
+    /// could have produced) is deterministically ignored — every replica sees
+    /// the same bytes and reaches the same refusal.
+    fn apply_conf_appended(&mut self, index: LogIndex, change: &ConfChange) {
+        let Ok(next) = self.cluster.apply(change) else {
+            return;
+        };
+        self.cluster = next;
+        if index > self.commit_index {
+            self.pending_conf = Some(index);
+        }
+        if self.role != Role::Leader {
+            return;
+        }
+        match change.op {
+            crate::membership::ConfOp::AddLearner | crate::membership::ConfOp::Promote => {
+                // A new replication target needs tracking from this leader's
+                // end at once, or it hears nothing until the next election.
+                let (last, _) = last_log(&self.storage);
+                self.next_index.entry(change.node).or_insert(last + 1);
+                self.match_index.entry(change.node).or_insert(0);
+                self.send_append(change.node);
+            }
+            crate::membership::ConfOp::RemoveVoter | crate::membership::ConfOp::RemoveLearner => {
+                self.next_index.remove(&change.node);
+                self.match_index.remove(&change.node);
+                self.sent_snapshot.remove(&change.node);
+            }
+        }
+    }
+
+    /// Reapplies conf entries in `[from, last]` over the current cluster —
+    /// after an install (base config replaced), a truncation (prefix
+    /// recomputed), or at open (log replay). The latest uncommitted conf entry
+    /// becomes the pending change again.
+    fn replay_conf(&mut self, from: LogIndex) {
+        let last = self.storage.last_index().expect("raft storage");
+        if last >= from {
+            for entry in self.storage.entries(from, last + 1).expect("raft storage") {
+                if let Some(change) = decode_conf(&entry.command) {
+                    if let Ok(next) = self.cluster.apply(&change) {
+                        self.cluster = next;
+                    }
+                    if entry.index > self.commit_index {
+                        self.pending_conf = Some(entry.index);
+                    }
+                }
+            }
+        }
+    }
+
+    /// A conf entry this node stored is now committed: the next change may
+    /// proceed. Called at both commit-advance sites (leader rule and follower
+    /// leader-commit tracking).
+    fn clear_committed_conf(&mut self) {
+        if self.pending_conf.is_some_and(|i| i <= self.commit_index) {
+            self.pending_conf = None;
+        }
+    }
+
+    /// A leader that just committed its own removal has no quorum left to
+    /// lead: it steps down at once and hands the group to the most-caught-up
+    /// voter, which campaigns immediately instead of waiting out a timeout.
+    /// Without the handoff, removing the leader buys an election-timeout
+    /// outage the operator never asked for.
+    fn step_down_if_removed(&mut self) {
+        if self.role != Role::Leader || self.cluster.is_voter(self.config.id) {
+            return;
+        }
+        self.role = Role::Follower;
+        self.leader_id = None;
+        self.abandon_reads();
+        self.votes_received.clear();
+        self.reset_election_timer();
+        let best =
+            self.cluster.voters.iter().copied().max_by_key(|p| {
+                (self.match_index.get(p).copied().unwrap_or(0), std::cmp::Reverse(*p))
+            });
+        if let Some(to) = best {
+            self.send(
+                to,
+                Message::TimeoutNow { term: self.current_term, leader_id: self.config.id },
+            );
+        }
     }
 
     /// This call's new actions, retained in the outbox for `ready()`.
     fn new_actions_since(&mut self, checkpoint: usize) -> Vec<Action> {
         self.outbox[checkpoint..].to_vec()
+    }
+
+    /// Snapshots the prefix through `snapshot.last_included_index` (M8). The
+    /// caller scanned the image from its own state machine, so unlike a
+    /// received snapshot there is nothing to report — the prefix is dropped
+    /// and the caller syncs storage before acting further.
+    ///
+    /// Returns whether the snapshot was taken. `false` means the caller asked
+    /// for something incoherent: past the commit (unapplied state, not
+    /// snapshottable) or at/below the existing base (a regression, never an
+    /// advance). Both are refused rather than clamped — silently taking the
+    /// wrong snapshot would diverge the log from the state it describes.
+    pub fn take_snapshot(&mut self, snapshot: Snapshot) -> bool {
+        let base = self.storage.first_index().expect("raft storage");
+        if snapshot.last_included_index < base || snapshot.last_included_index > self.commit_index {
+            return false;
+        }
+        self.storage.save_snapshot(&snapshot).expect("raft storage");
+        self.storage.truncate_prefix(snapshot.last_included_index).expect("raft storage");
+        self.last_applied = self.last_applied.max(snapshot.last_included_index);
+        true
     }
 
     /// Consumes the node, returning its storage.
@@ -718,9 +1291,10 @@ impl<S: RaftStorage> RaftNode<S> {
     /// Installs a divergent log fixture (paper figure 7).
     #[cfg(test)]
     pub(crate) fn replace_log_for_tests(&mut self, entries: Vec<Entry>) {
-        self.storage.truncate_suffix(1).expect("raft storage");
+        self.truncate_suffix(1);
         if !entries.is_empty() {
             self.storage.append(&entries).expect("raft storage");
+            self.replay_conf(1);
         }
     }
 
@@ -736,6 +1310,38 @@ impl<S: RaftStorage> RaftNode<S> {
     #[cfg(test)]
     pub(crate) fn set_next_index_for_tests(&mut self, peer: NodeId, next: LogIndex) {
         self.next_index.insert(peer, next);
+    }
+
+    /// Snapshots the prefix through `up_to` with an empty state image, then
+    /// truncates it — what the driver does with a real scan at M8.3, minus the
+    /// state machine. Test-only; the term comes from the stored entry so the
+    /// boundary stays honest.
+    #[cfg(test)]
+    pub(crate) fn compact_prefix_for_tests(&mut self, up_to: LogIndex) {
+        let term =
+            self.storage.term(up_to).expect("raft storage").expect("compacted index must exist");
+        let snap = Snapshot {
+            last_included_index: up_to,
+            last_included_term: term,
+            data: Vec::new(),
+            config: self.cluster.clone(),
+        };
+        self.storage.save_snapshot(&snap).expect("raft storage");
+        self.storage.truncate_prefix(up_to).expect("raft storage");
+    }
+}
+
+/// The membership of a genuinely fresh store: founding voters vote (plus
+/// ourselves, since `peers` names everyone *else*), while a joining node
+/// starts as the voters' learner.
+fn initial_cluster(config: &Config) -> ClusterConfig {
+    let mut voters: std::collections::BTreeSet<NodeId> = config.peers.iter().copied().collect();
+    voters.remove(&config.id);
+    if config.initial_learner {
+        ClusterConfig { voters, learners: [config.id].into_iter().collect() }
+    } else {
+        voters.insert(config.id);
+        ClusterConfig { voters, learners: std::collections::BTreeSet::new() }
     }
 }
 

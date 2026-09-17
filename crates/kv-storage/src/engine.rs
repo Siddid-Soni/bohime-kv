@@ -15,11 +15,14 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::sync::Arc;
+// pread. Linux-only by design: the project targets Linux and CI runs it there.
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::EngineConfig;
-use crate::index::{HashMapIndex, KeyDirIndex, SegmentId, ValueLoc};
+use crate::index::{Index, KeyDirIndex, KeyDirRead, KeyDirReadFactory, SegmentId, ValueLoc};
 use crate::record::Record;
 
 fn now_millis() -> u64 {
@@ -200,7 +203,7 @@ fn clear_orphan_tmp_files(dir: &Path) -> io::Result<()> {
 /// it; whichever record for a key is replayed last wins. Callers must
 /// replay segments in ascending `SegmentId` order for that to be correct
 /// across the whole log, not just within one file.
-fn replay(mut file: &File, segment_id: SegmentId, index: &mut HashMapIndex) -> io::Result<u64> {
+fn replay(mut file: &File, segment_id: SegmentId, index: &mut Index) -> io::Result<u64> {
     file.seek(SeekFrom::Start(0))?;
     let mut buf = Vec::new();
     file.read_to_end(&mut buf)?;
@@ -228,13 +231,117 @@ fn replay(mut file: &File, segment_id: SegmentId, index: &mut HashMapIndex) -> i
     Ok(offset)
 }
 
+/// The engine's open segment files. Held behind an `Arc` so a reader can take
+/// a snapshot of it without locking; `File` needs no `&mut` to be read from,
+/// since reads use pread.
+///
+/// One handle per segment. A previous revision opened each segment several
+/// times so concurrent readers would not share a kernel `struct file` — the
+/// `f_count` that `fget` bumps on every syscall. That was a workaround for the
+/// blocking-read model and is gone with it: `io_uring` submissions against
+/// registered files never take that path. The measurements that motivated it
+/// are in `docs/superpowers/plans/2026-09-17-read-path-handoff.md`, and remain
+/// relevant to the pread fallback if it ever becomes the common path.
+pub(crate) type SegmentMap = BTreeMap<SegmentId, Arc<File>>;
+
+/// A read that has been resolved against the keydir but not yet performed.
+///
+/// This is the seam that lets a value read leave the thread owning the
+/// engine. The keydir lookup — the part that races with writes — stays on the
+/// owner; what crosses the boundary is an offset and a snapshot of the open
+/// segment handles, neither of which any writer mutates in place. A segment
+/// retired by compaction after this was handed out is unlinked but still
+/// open, so the bytes remain readable.
+///
+/// `Send`, deliberately: handing it to a blocking pool is the entire point.
+pub struct ValueRef {
+    loc: ValueLoc,
+    segments: Arc<SegmentMap>,
+}
+
+impl ValueRef {
+    /// The descriptor holding this value.
+    ///
+    /// Valid only while this `ValueRef` lives: it keeps the segment map alive,
+    /// and that is what holds the descriptor open. An I/O engine that submits
+    /// against this fd must therefore keep the `ValueRef` until the read
+    /// completes, not merely until it is submitted. A segment retired by
+    /// compaction in the meantime is unlinked but still open, so the read
+    /// still returns the right bytes.
+    pub fn raw_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        self.segments.get(&self.loc.segment_id).expect("indexed segment must be open").as_raw_fd()
+    }
+
+    /// Byte offset of the record within its segment.
+    pub fn offset(&self) -> u64 {
+        self.loc.offset
+    }
+
+    /// Exact byte length to read. The record is self-delimiting, so a short
+    /// read cannot be detected by decoding alone — the caller must read this
+    /// many bytes.
+    pub fn len(&self) -> usize {
+        self.loc.len as usize
+    }
+
+    /// Whether this value is zero-length. Present because clippy asks for it
+    /// alongside `len`; a stored record always has a header, so this is never
+    /// true in practice.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Turns bytes read at `(raw_fd, offset, len)` into the record's value.
+    /// Separate from `read` so an external I/O engine can own the transfer and
+    /// still share the decoding — including the CRC check, which is the reason
+    /// this must not be reimplemented by callers.
+    pub fn decode(&self, buf: &[u8]) -> io::Result<Vec<u8>> {
+        let (record, _) =
+            Record::decode(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        Ok(record.value)
+    }
+
+    /// Performs the disk read. Blocking, and meant to be: callers on an async
+    /// runtime should run it somewhere that tolerates blocking.
+    pub fn read(&self) -> io::Result<Vec<u8>> {
+        read_value_at(&self.segments, self.loc)
+    }
+}
+
+/// Shared by `Engine::get` and `ValueRef::read` so both resolve a location the
+/// same way.
+///
+/// `read_exact_at` (pread), not `seek` + `read_exact`: the offset travels with
+/// the call instead of living in the file's cursor, so this needs only `&File`
+/// and any number of threads can be inside it at once. A seek here would make
+/// two concurrent readers move each other's cursor and read each other's bytes.
+///
+/// Safe against a concurrent append because the active segment is opened
+/// `O_APPEND`: writes go to the end regardless of the cursor, and pread never
+/// touches it.
+fn read_value_at(segments: &SegmentMap, loc: ValueLoc) -> io::Result<Vec<u8>> {
+    let file = segments.get(&loc.segment_id).expect("indexed segment must be open");
+    let mut buf = vec![0u8; loc.len as usize];
+    file.read_exact_at(&mut buf, loc.offset)?;
+
+    let (record, _) =
+        Record::decode(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    Ok(record.value)
+}
+
 pub struct Engine {
     dir: PathBuf,
     config: EngineConfig,
     active_id: SegmentId,
     active_offset: u64,
-    segments: BTreeMap<SegmentId, File>,
-    index: HashMapIndex,
+    /// Shared immutably so a resolved read can be handed to another thread
+    /// (see `locate`). Only this engine mutates it, and it does so
+    /// copy-on-write via `Arc::make_mut` — which clones the map only while
+    /// a reader still holds the previous snapshot. `ArcSwap` would buy
+    /// nothing here: there is exactly one writer of the pointer.
+    segments: Arc<SegmentMap>,
+    index: Index,
     unsynced: usize,
     last_sync: std::time::Instant,
     syncs: u64,
@@ -274,12 +381,12 @@ impl Engine {
 
         let mut segments = BTreeMap::new();
         for &id in &ids {
-            segments.insert(id, open_segment(&dir, id)?);
+            segments.insert(id, Arc::new(open_segment(&dir, id)?));
         }
 
         let active_id = *ids.last().expect("ids always has at least one entry");
 
-        let mut index = HashMapIndex::default();
+        let mut index = Index::new(config.index);
         for &id in &ids {
             if id != active_id
                 && let Some(hints) = read_hint_file(&dir, id)?
@@ -312,13 +419,18 @@ impl Engine {
                 discarded = on_disk_len - valid_len,
                 "discarding torn tail of active segment after unclean shutdown"
             );
-            segments
-                .get_mut(&id)
-                .expect("segment just replayed must be open")
-                .set_len(valid_len)?;
+            segments.get(&id).expect("segment just replayed must be open").set_len(valid_len)?;
         }
 
         let active_offset = segments[&active_id].metadata()?.len();
+
+        // Everything replay just inserted is a write like any other, so it is
+        // pending until published. A freshly opened engine whose readers could
+        // not see its own contents would look empty to every `Get` until the
+        // first entry was applied.
+        let segments = Arc::new(segments);
+        index.set_segments(Arc::clone(&segments));
+        index.publish();
 
         Ok(Self {
             dir,
@@ -345,7 +457,8 @@ impl Engine {
             self.rotate()?;
         }
 
-        let file = self.segments.get_mut(&self.active_id).expect("active segment always present");
+        let mut file: &File =
+            self.segments.get(&self.active_id).expect("active segment always present");
         file.write_all(encoded)?;
 
         let loc = ValueLoc { segment_id: self.active_id, offset: self.active_offset, len };
@@ -386,10 +499,50 @@ impl Engine {
     fn rotate(&mut self) -> io::Result<()> {
         self.sync()?;
         self.active_id += 1;
-        let file = open_segment(&self.dir, self.active_id)?;
-        self.segments.insert(self.active_id, file);
+        let opened = open_segment(&self.dir, self.active_id)?;
+        let id = self.active_id;
+        self.update_segments(|map| {
+            map.insert(id, Arc::new(opened));
+        });
         self.active_offset = 0;
         Ok(())
+    }
+
+    /// Changes which segments are open, copy-on-write, and tells readers.
+    ///
+    /// The previous `Arc` stays valid for whoever holds it, which is what
+    /// makes a `ValueRef` handed out before the change still readable — and
+    /// what keeps a retired segment's descriptor alive for a reader still on
+    /// the keydir copy that names it.
+    fn update_segments(&mut self, edit: impl FnOnce(&mut SegmentMap)) {
+        edit(Arc::make_mut(&mut self.segments));
+        self.index.set_segments(Arc::clone(&self.segments));
+    }
+
+    /// Makes every write since the last publish visible to readers, and says
+    /// whether it managed to.
+    ///
+    /// The caller stores its own "visible up to" index only when this returns
+    /// `true`. `false` is not an error: it means a reader is still inside the
+    /// copy the swap would overwrite, and the engine will not block a writer
+    /// on a reader. Retry on the next pass.
+    ///
+    /// A no-op that always succeeds for [`crate::IndexKind::Locked`], where a
+    /// write is visible the moment it returns.
+    pub fn publish(&mut self) -> bool {
+        self.index.publish()
+    }
+
+    /// Whether any write is applied but not yet visible to readers.
+    pub fn has_unpublished(&self) -> bool {
+        self.index.has_unpublished()
+    }
+
+    /// Mints reader-side views of this engine. `Send + Sync`, so it belongs in
+    /// a service struct; each reading task turns it into a [`ReadView`] of its
+    /// own, because the underlying `ReadHandle` is `!Sync`.
+    pub fn read_view_factory(&self) -> ReadViewFactory {
+        ReadViewFactory { keydir: self.index.read_factory() }
     }
 
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> io::Result<()> {
@@ -400,22 +553,32 @@ impl Engine {
         Ok(())
     }
 
-    pub fn get(&mut self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
+    pub fn get(&self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
         let Some(loc) = self.index.get(key) else {
             return Ok(None);
         };
-        Ok(Some(self.read_value_at(loc)?))
+        Ok(Some(read_value_at(&self.segments, loc)?))
     }
 
-    fn read_value_at(&mut self, loc: ValueLoc) -> io::Result<Vec<u8>> {
-        let file = self.segments.get_mut(&loc.segment_id).expect("indexed segment must be open");
-        let mut buf = vec![0u8; loc.len as usize];
-        file.seek(SeekFrom::Start(loc.offset))?;
-        file.read_exact(&mut buf)?;
+    /// Resolves `key` against the keydir without touching the disk, handing
+    /// back everything the actual read needs. The caller can then perform it
+    /// anywhere — notably off the task that owns this engine — while this
+    /// engine goes on taking writes.
+    pub fn locate(&self, key: &[u8]) -> Option<ValueRef> {
+        let loc = self.index.get(key)?;
+        Some(ValueRef { loc, segments: Arc::clone(&self.segments) })
+    }
 
-        let (record, _) =
-            Record::decode(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        Ok(record.value)
+    /// Every live `(key, value)` pair — the state image M8 snapshots are a
+    /// scan of. Tombstones are already out of the keydir, so deleted keys do
+    /// not appear; reserved (`\x00`) keys do, which is how the session table
+    /// rides along inside the snapshot instead of beside it.
+    pub fn scan(&self) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut out = Vec::new();
+        for (key, loc) in self.index.iter() {
+            out.push((key, read_value_at(&self.segments, loc)?));
+        }
+        Ok(out)
     }
 
     /// Writes a tombstone record so the deletion survives reopen, then
@@ -461,7 +624,7 @@ impl Engine {
 
         let mut entries = Vec::with_capacity(live.len());
         for (key, loc) in live {
-            let value = self.read_value_at(loc)?;
+            let value = read_value_at(&self.segments, loc)?;
             entries.push((key, loc, value));
         }
 
@@ -515,16 +678,26 @@ impl Engine {
             CompactionManifest { new_id: Some(new_segment_id), old_ids: old_segment_ids.clone() }
         };
 
-        for id in &old_segment_ids {
-            self.segments.remove(id);
-        }
-
         write_manifest(&self.dir, &manifest)?;
         finish_compaction(&self.dir, &manifest)?;
 
-        if let Some(new_id) = manifest.new_id {
-            self.segments.insert(new_id, open_segment(&self.dir, new_id)?);
-        }
+        // A reader on the keydir copy this is replacing still points into the
+        // segments being retired — and the merged segment deliberately reuses
+        // the smallest retired id, so their descriptors cannot simply be
+        // replaced in place. The old map stays alive for as long as that copy
+        // does, because it is *inside* that copy; this builds a new one.
+        let reopened = match manifest.new_id {
+            Some(new_id) => Some((new_id, Arc::new(open_segment(&self.dir, new_id)?))),
+            None => None,
+        };
+        self.update_segments(|map| {
+            for id in &old_segment_ids {
+                map.remove(id);
+            }
+            if let Some((new_id, file)) = reopened {
+                map.insert(new_id, file);
+            }
+        });
 
         Ok(())
     }
@@ -534,4 +707,106 @@ pub(crate) struct CompactionPlan {
     pub(crate) old_segment_ids: Vec<SegmentId>,
     pub(crate) new_segment_id: SegmentId,
     entries: Vec<(Vec<u8>, ValueLoc, Vec<u8>)>,
+}
+
+/// Mints [`ReadView`]s. Cheap to clone and safe to share.
+#[derive(Debug, Clone)]
+pub struct ReadViewFactory {
+    keydir: KeyDirReadFactory,
+}
+
+impl ReadViewFactory {
+    pub fn view(&self) -> ReadView {
+        ReadView { keydir: self.keydir.handle() }
+    }
+
+    /// Parks a reader inside the published copy and keeps it there until the
+    /// returned value is dropped.
+    ///
+    /// Test support, and it tests something real: while a reader is inside the
+    /// copy a swap would overwrite, [`Engine::publish`] cannot proceed. That
+    /// is left-right's documented cost — "a slow reader stalls the writer" —
+    /// and holding one is the only way to make the window between *applied*
+    /// and *visible* deterministic instead of a race that passes by luck.
+    ///
+    /// Only defers a publish if it is taken before the publish that records
+    /// its epoch: left-right waits for readers that entered before the last
+    /// swap, not for ones that arrived after it.
+    pub fn hold_read_copy(&self) -> ReadHold {
+        let keydir = self.keydir.clone();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let (parked, entered) = std::sync::mpsc::channel::<()>();
+        // A thread rather than a guard held by the caller: a `ReadGuard`
+        // borrows its handle, so a value owning both would be
+        // self-referential. This thread owns both and parks.
+        let thread = std::thread::Builder::new()
+            .name("kv-read-hold".into())
+            .spawn(move || {
+                let handle = keydir.handle();
+                let _guard = match &handle {
+                    KeyDirRead::LeftRight(handle) => handle.enter(),
+                    // Nothing to park behind: a locked write is visible
+                    // immediately, so there is no window to hold open.
+                    KeyDirRead::Locked(_) => None,
+                };
+                let _ = parked.send(());
+                // Until the `ReadHold` is dropped, which closes this channel.
+                let _ = wait.recv();
+            })
+            .expect("spawning a test hold thread");
+        // Inside before this returns, so the caller can rely on the next
+        // publish seeing it.
+        let _ = entered.recv();
+        ReadHold { release: Some(release), thread: Some(thread) }
+    }
+}
+
+/// One task's reader-side view of the engine: the published keydir plus the
+/// open segment handles.
+///
+/// This is the half of `Engine` that needs no `&mut` and no lock. What it can
+/// see is whatever the last [`Engine::publish`] made visible, which is why a
+/// linearizable read has to wait on the published index rather than the
+/// applied one.
+#[derive(Debug)]
+pub struct ReadView {
+    keydir: KeyDirRead,
+}
+
+impl ReadView {
+    /// Resolves `key` against the published keydir, handing back everything
+    /// the disk read needs. The same contract as [`Engine::locate`], from a
+    /// thread that does not own the engine.
+    pub fn locate(&self, key: &[u8]) -> Option<ValueRef> {
+        let (loc, segments) = self.keydir.locate(key)?;
+        Some(ValueRef { loc, segments })
+    }
+
+    /// Performs the whole read here, disk included. The blocking form, for
+    /// callers with nowhere better to put the transfer.
+    pub fn get(&self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
+        match self.locate(key) {
+            Some(located) => located.read().map(Some),
+            None => Ok(None),
+        }
+    }
+}
+
+/// A reader parked inside the published copy. See
+/// [`ReadViewFactory::hold_read_copy`].
+#[derive(Debug)]
+pub struct ReadHold {
+    release: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for ReadHold {
+    fn drop(&mut self) {
+        drop(self.release.take());
+        // Joined, so that when this returns the reader has really left and
+        // the next publish cannot be deferred by it.
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }

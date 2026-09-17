@@ -55,13 +55,40 @@ pub trait RaftStorage {
 
     /// The most recent snapshot, if any. Written at M8; `None` until then.
     fn snapshot(&self) -> Result<Option<Snapshot>, Self::Error>;
+
+    /// Persists a snapshot replacing the log prefix up to and including
+    /// `snapshot.last_included_index` (M8). Does not delete any entries —
+    /// `truncate_prefix` does that — so a crash between the two leaves the
+    /// prefix redundantly stored, never lost.
+    fn save_snapshot(&mut self, snapshot: &Snapshot) -> Result<(), Self::Error>;
+
+    /// The smallest available log index: 1 on a fresh store, otherwise one
+    /// past the truncated prefix. A fully-compacted log reports
+    /// `last_index() + 1`, so the next append continues the sequence instead
+    /// of reusing an index the snapshot already covers.
+    fn first_index(&self) -> Result<LogIndex, Self::Error>;
+
+    /// Discards every entry with index `<= up_to`. A no-op below the current
+    /// base. The snapshot (if any) is untouched — this only drops the log
+    /// prefix it already describes.
+    fn truncate_prefix(&mut self, up_to: LogIndex) -> Result<(), Self::Error>;
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MemStorage {
     entries: BTreeMap<LogIndex, Entry>,
     hard_state: HardState,
     snapshot: Option<Snapshot>,
+    /// One past the highest truncated prefix index. Stays 1 until the first
+    /// `truncate_prefix`; the snapshot alone never moves it, because the
+    /// entries it describes are still stored until they are truncated.
+    base: LogIndex,
+}
+
+impl Default for MemStorage {
+    fn default() -> Self {
+        Self { entries: BTreeMap::new(), hard_state: HardState::default(), snapshot: None, base: 1 }
+    }
 }
 
 impl RaftStorage for MemStorage {
@@ -96,14 +123,24 @@ impl RaftStorage for MemStorage {
     }
 
     fn entries(&self, lo: LogIndex, hi: LogIndex) -> Result<Vec<Entry>, Self::Error> {
-        Ok(self.entries.range(lo..hi).map(|(_, e)| e.clone()).collect())
+        Ok(self.entries.range(lo.max(self.base)..hi).map(|(_, e)| e.clone()).collect())
     }
 
     fn term(&self, idx: LogIndex) -> Result<Option<Term>, Self::Error> {
         if idx == 0 {
             return Ok(Some(0));
         }
-        Ok(self.entries.get(&idx).map(|e| e.term))
+        if let Some(entry) = self.entries.get(&idx) {
+            return Ok(Some(entry.term));
+        }
+        // The boundary term survives the prefix it describes; below it the
+        // log is gone and only the snapshot knows anything.
+        if let Some(snap) = &self.snapshot
+            && idx == snap.last_included_index
+        {
+            return Ok(Some(snap.last_included_term));
+        }
+        Ok(None)
     }
 
     fn truncate_suffix(&mut self, from: LogIndex) -> Result<(), Self::Error> {
@@ -112,10 +149,30 @@ impl RaftStorage for MemStorage {
     }
 
     fn last_index(&self) -> Result<LogIndex, Self::Error> {
-        Ok(self.entries.keys().next_back().copied().unwrap_or(0))
+        let entries_last = self.entries.keys().next_back().copied().unwrap_or(0);
+        let snap_last = self.snapshot.as_ref().map(|s| s.last_included_index).unwrap_or(0);
+        Ok(entries_last.max(snap_last))
     }
 
     fn snapshot(&self) -> Result<Option<Snapshot>, Self::Error> {
         Ok(self.snapshot.clone())
+    }
+
+    fn save_snapshot(&mut self, snapshot: &Snapshot) -> Result<(), Self::Error> {
+        self.snapshot = Some(snapshot.clone());
+        Ok(())
+    }
+
+    fn first_index(&self) -> Result<LogIndex, Self::Error> {
+        Ok(self.base)
+    }
+
+    fn truncate_prefix(&mut self, up_to: LogIndex) -> Result<(), Self::Error> {
+        if up_to < self.base {
+            return Ok(());
+        }
+        self.entries.retain(|&idx, _| idx > up_to);
+        self.base = up_to + 1;
+        Ok(())
     }
 }

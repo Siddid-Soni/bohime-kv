@@ -23,23 +23,57 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kv_raft::{Message, NodeId, RaftNode};
-use kv_storage::Engine;
+use kv_ring::{ShardId, ShardMap};
+use kv_storage::{Engine, ReadHold, ReadViewFactory};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::NodeConfig;
-use crate::driver::{ClientOp, ClientReply, ClientRequest, Driver};
+use crate::driver::{
+    AdminOp, AdminReply, AdminRequest, ClientOp, ClientReply, ClientRequest, ClusterStatus, Driver,
+    Group, GroupChannels, ShardStatus,
+};
+use crate::meta::{MetaReconciler, PublishedMap};
 use crate::storage::BitcaskStorage;
-use crate::transport::PeerLink;
+use crate::transport::group::{self, GroupId};
 use crate::transport::peer::SendError;
 use crate::transport::server::Inbound;
+use crate::transport::{PeerFactory, PeerLink};
 
 pub(crate) const ALL: [NodeId; 3] = [1, 2, 3];
 
+/// The message kinds M8's gate needs to observe on the wire. Only kinds are
+/// recorded, never payloads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Traffic {
+    InstallSnapshot,
+    AppendEntries { entries: usize },
+    InstallSnapshotResp { success: bool },
+}
+
+fn classify(msg: &Message) -> Option<Traffic> {
+    match msg {
+        Message::InstallSnapshot { .. } => Some(Traffic::InstallSnapshot),
+        Message::AppendEntries { entries, .. } => {
+            Some(Traffic::AppendEntries { entries: entries.len() })
+        }
+        Message::InstallSnapshotResp { success, .. } => {
+            Some(Traffic::InstallSnapshotResp { success: *success })
+        }
+        _ => None,
+    }
+}
+
 /// Who can talk to whom. A partition blocks both directions, because a real
 /// one does.
-#[derive(Default)]
 pub(crate) struct Switchboard {
     blocked: Mutex<BTreeSet<(NodeId, NodeId)>>,
+    traffic: Mutex<Vec<(NodeId, NodeId, Traffic)>>,
+}
+
+impl Default for Switchboard {
+    fn default() -> Self {
+        Self { blocked: Mutex::new(BTreeSet::new()), traffic: Mutex::new(Vec::new()) }
+    }
 }
 
 impl Switchboard {
@@ -60,9 +94,45 @@ impl Switchboard {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn heal(&self) {
         self.blocked.lock().unwrap().clear();
+    }
+
+    /// Records an observable message kind. The M8 gate asserts on this log:
+    /// a follower that caught up via snapshot must have been *sent* one, and
+    /// must have answered it successfully before any tail appends flowed.
+    pub(crate) fn note(&self, from: NodeId, to: NodeId, traffic: Traffic) {
+        self.traffic.lock().unwrap().push((from, to, traffic));
+    }
+
+    pub(crate) fn traffic(&self) -> Vec<(NodeId, NodeId, Traffic)> {
+        self.traffic.lock().unwrap().clone()
+    }
+}
+
+/// Every group's inbox on every node, by `(node, group)`.
+///
+/// A registry rather than a link holding its peer's `Sender` directly, because
+/// since M9 a node can be *admitted* to a running cluster: the link exists
+/// before the node it addresses does, exactly as a `PeerClient` does when the
+/// process it dials has not started yet.
+///
+/// Keyed by group as well as node since M10: a node hosts the data group and
+/// the meta group at one address, and a link that ignored the group would
+/// deliver one group's AppendEntries into the other's log — which is what the
+/// real `RaftService` uses the wire group id to prevent.
+#[derive(Default)]
+pub(crate) struct Registry {
+    inboxes: Mutex<BTreeMap<(NodeId, GroupId), mpsc::Sender<Inbound>>>,
+}
+
+impl Registry {
+    fn register(&self, id: NodeId, group: GroupId, inbox: mpsc::Sender<Inbound>) {
+        self.inboxes.lock().unwrap().insert((id, group), inbox);
+    }
+
+    fn inbox(&self, id: NodeId, group: GroupId) -> Option<mpsc::Sender<Inbound>> {
+        self.inboxes.lock().unwrap().get(&(id, group)).cloned()
     }
 }
 
@@ -71,20 +141,51 @@ impl Switchboard {
 struct TestLink {
     me: NodeId,
     peer: NodeId,
-    peer_inbox: mpsc::Sender<Inbound>,
-    my_replies: mpsc::Sender<(NodeId, Message)>,
+    registry: Arc<Registry>,
+    my_replies: mpsc::Sender<(GroupId, NodeId, Message)>,
     switchboard: Arc<Switchboard>,
 }
 
+/// Opens `TestLink`s on the driver's behalf, so a conf change can bring a peer
+/// into an already-running node the same way the real `GrpcPeers` does.
+struct TestPeers {
+    me: NodeId,
+    registry: Arc<Registry>,
+    my_replies: mpsc::Sender<(GroupId, NodeId, Message)>,
+    switchboard: Arc<Switchboard>,
+}
+
+impl PeerFactory for TestPeers {
+    fn connect(&self, id: NodeId, _address: &str) -> Box<dyn PeerLink> {
+        Box::new(TestLink {
+            me: self.me,
+            peer: id,
+            registry: Arc::clone(&self.registry),
+            my_replies: self.my_replies.clone(),
+            switchboard: Arc::clone(&self.switchboard),
+        })
+    }
+}
+
 impl PeerLink for TestLink {
-    fn try_send(&self, msg: Message) -> Result<(), SendError> {
+    fn try_send(&self, group: GroupId, msg: Message) -> Result<(), SendError> {
         // Outbound drop: the request never reaches the peer.
         if !self.switchboard.allows(self.me, self.peer) {
             return Ok(());
         }
+        // A peer that has not started yet: the real client would be retrying a
+        // refused connection. Shedding is the same observable outcome.
+        let Some(peer_inbox) = self.registry.inbox(self.peer, group) else {
+            return Ok(());
+        };
+        if group == group::DATA
+            && let Some(traffic) = classify(&msg)
+        {
+            self.switchboard.note(self.me, self.peer, traffic);
+        }
         let (reply, wait) = oneshot::channel();
-        self.peer_inbox
-            .try_send(Inbound { from: self.me, msg, reply })
+        peer_inbox
+            .try_send(Inbound { group, from: self.me, msg, reply })
             .map_err(|_| SendError::Full)?;
 
         let (me, peer) = (self.me, self.peer);
@@ -95,7 +196,12 @@ impl PeerLink for TestLink {
                 // Inbound drop: the reply is lost on the way back, which a
                 // partition does just as readily as losing the request.
                 if switchboard.allows(peer, me) {
-                    let _ = replies.try_send((peer, answer));
+                    if group == group::DATA
+                        && let Some(traffic) = classify(&answer)
+                    {
+                        switchboard.note(peer, me, traffic);
+                    }
+                    let _ = replies.try_send((group, peer, answer));
                 }
             }
         });
@@ -104,12 +210,110 @@ impl PeerLink for TestLink {
 }
 
 pub(crate) struct Cluster {
+    /// What the *map* describes, which the nodes' flags must agree with or the
+    /// reconciler aborts them.
+    num_shards: u16,
+    replication_factor: u8,
+    /// The placement the harness founded its groups from, for a sharded
+    /// cluster. `None` for the single-group harnesses, which name their one
+    /// group directly.
+    placement: Option<ShardMap>,
     requests: BTreeMap<NodeId, mpsc::Sender<ClientRequest>>,
+    admin: BTreeMap<NodeId, mpsc::Sender<AdminRequest>>,
+    /// The meta group's channels, node for node beside the data group's.
+    meta_requests: BTreeMap<NodeId, mpsc::Sender<ClientRequest>>,
+    meta_admin: BTreeMap<NodeId, mpsc::Sender<AdminRequest>>,
+    /// What each node's reconciler has published for its request handlers.
+    published: BTreeMap<NodeId, PublishedMap>,
+    /// Each node's reader-side handle on its data group's state machine
+    /// (M11.5). The harness keeps one so a test can park a reader inside the
+    /// published keydir copy and make the applied-but-not-yet-visible window
+    /// deterministic.
+    read_views: BTreeMap<NodeId, ReadViewFactory>,
+    registry: Arc<Registry>,
     switchboard: Arc<Switchboard>,
+    /// Kept alive for the driver's sake: dropping a node's inbox or peer-reply
+    /// sender closes that `select!` arm under it.
+    _keepalive: Vec<Box<dyn std::any::Any + Send>>,
     _dirs: Vec<tempfile::TempDir>,
 }
 
+/// How one node is configured when the harness starts it.
+struct Spec {
+    id: NodeId,
+    /// The members this node is told about at boot. Empty for a node that
+    /// joins an existing cluster: it learns the membership from the log.
+    peers: Vec<NodeId>,
+    /// True for a node admitted at runtime — it starts as a learner rather
+    /// than as a founding voter.
+    joining: bool,
+    lease_reads: bool,
+    /// Which keydir this node's state machines hold (M11.5). Every harness
+    /// but `Cluster::of_three_on` uses the default, so the whole suite runs
+    /// against the implementation production runs.
+    keydir: kv_storage::IndexKind,
+    snapshot_threshold: u64,
+    /// The shards this node founds a Raft group for.
+    ///
+    /// Separate from `num_shards`, which is what the *map* describes. The
+    /// harness founds groups itself rather than going through
+    /// `shards::ShardSupervisor`, so a test can host one shard while the map
+    /// still describes 256 — and so that every test written before M11 keeps
+    /// exercising the driver and Raft rather than placement.
+    shards: Vec<ShardId>,
+}
+
 impl Cluster {
+    fn empty(num_shards: u16, replication_factor: u8) -> Cluster {
+        Cluster {
+            num_shards,
+            replication_factor,
+            placement: None,
+            requests: BTreeMap::new(),
+            admin: BTreeMap::new(),
+            meta_requests: BTreeMap::new(),
+            meta_admin: BTreeMap::new(),
+            published: BTreeMap::new(),
+            read_views: BTreeMap::new(),
+            registry: Arc::new(Registry::default()),
+            switchboard: Arc::new(Switchboard::default()),
+            _keepalive: Vec::new(),
+            _dirs: Vec::new(),
+        }
+    }
+
+    /// `nodes` nodes, `num_shards` shards, `rf` replicas each — every node
+    /// hosting exactly the shard groups the ring gives it (M11.9).
+    ///
+    /// The placement is computed here with the same `kv-ring` call the meta
+    /// reconciler makes from the same inputs, so the map this cluster's own
+    /// meta group bootstraps is the identical version 1 and the harness and
+    /// the cluster cannot disagree about who holds what.
+    pub(crate) fn sharded(nodes: &[NodeId], num_shards: u16, rf: u8) -> Cluster {
+        let map =
+            ShardMap::build(1, nodes.iter().copied(), num_shards, rf, kv_ring::DEFAULT_VNODES)
+                .expect("placeable");
+        let mut cluster = Cluster::empty(num_shards, rf);
+        cluster.placement = Some(map.clone());
+        for &id in nodes {
+            cluster.start(Spec {
+                id,
+                peers: nodes.iter().copied().filter(|&p| p != id).collect(),
+                joining: false,
+                lease_reads: false,
+                keydir: kv_storage::IndexKind::default(),
+                snapshot_threshold: u64::MAX,
+                shards: map.shards_of(id).collect(),
+            });
+        }
+        cluster
+    }
+
+    /// The placement this harness founded its groups from.
+    pub(crate) fn placement(&self) -> &ShardMap {
+        self.placement.as_ref().expect("only a sharded cluster has a placement")
+    }
+
     pub(crate) fn of_three() -> Cluster {
         Cluster::of_three_with(false)
     }
@@ -117,99 +321,555 @@ impl Cluster {
     /// `lease_reads` opts the whole cluster into §1.10's lease reads, which
     /// `tests::linearizability` uses to demonstrate what they cost.
     pub(crate) fn of_three_with(lease_reads: bool) -> Cluster {
-        let switchboard = Arc::new(Switchboard::default());
-        let mut dirs = Vec::new();
-        let mut configs = BTreeMap::new();
+        Cluster::with(lease_reads, u64::MAX, kv_storage::IndexKind::default())
+    }
 
+    /// A cluster whose state machines hold `keydir` (M11.5). For the tests
+    /// that hold the `RwLock<HashMap>` comparison arm to the same behaviour
+    /// as the default — it is a supported configuration, not a benchmark
+    /// fixture.
+    pub(crate) fn of_three_on(keydir: kv_storage::IndexKind) -> Cluster {
+        Cluster::with(false, u64::MAX, keydir)
+    }
+
+    /// A cluster that snapshots every `threshold` applied entries (M8). The
+    /// shared harnesses disable snapshots so timing-sensitive tests never see
+    /// a scan pause; M8's own gate opts in here.
+    pub(crate) fn with_snapshots(threshold: u64) -> Cluster {
+        Cluster::with(false, threshold, kv_storage::IndexKind::default())
+    }
+
+    fn with(lease_reads: bool, snapshot_threshold: u64, keydir: kv_storage::IndexKind) -> Cluster {
+        let mut cluster = Cluster::empty(256, 3);
         for &id in &ALL {
-            let dir = tempfile::tempdir().unwrap();
-            let config = NodeConfig {
+            cluster.start(Spec {
                 id,
-                listen: "127.0.0.1:0".parse().unwrap(),
-                peers: ALL
-                    .iter()
-                    .filter(|&&p| p != id)
-                    .map(|&p| (p, format!("in-process://{p}")))
-                    .collect(),
-                data_dir: dir.path().to_path_buf(),
-                // Short but not degenerate: an election must complete in a
-                // test's patience, while still leaving a heartbeat comfortably
-                // inside the election timeout.
-                tick: Duration::from_millis(10),
-                election_timeout: 10,
-                heartbeat_interval: 2,
+                peers: ALL.into_iter().filter(|&p| p != id).collect(),
+                joining: false,
                 lease_reads,
+                keydir,
+                snapshot_threshold,
+                // One shard group, numbered as shard 0's. Every harness
+                // request names it explicitly, so the map's 256 shards are
+                // beside the point here: these tests drive the driver, not
+                // the router.
+                shards: vec![0],
+            });
+        }
+        cluster
+    }
+
+    /// Starts a node that expects to be *admitted* rather than to found the
+    /// cluster: learner from the first tick, never campaigning, until an
+    /// `AddNode` brings it into the membership.
+    ///
+    /// `members` is what the operator would pass as `--peer`: the cluster as
+    /// it stands. A joiner needs it for the same reason a founder does — the
+    /// founding members' voter-hood came from argv and was never written to
+    /// the log, so there is no conf entry to replay it from. What the log
+    /// *does* carry is every change since, which is how this node learns
+    /// about members admitted after it.
+    pub(crate) fn start_joining_node(&mut self, id: NodeId, members: &[NodeId]) {
+        self.start(Spec {
+            id,
+            peers: members.iter().copied().filter(|&p| p != id).collect(),
+            joining: true,
+            lease_reads: false,
+            keydir: kv_storage::IndexKind::default(),
+            snapshot_threshold: u64::MAX,
+            // A joining node hosts the same one group, as a learner: it is
+            // being admitted to that group, so it has to be able to receive
+            // its AppendEntries. In production a shard reaching a new node is
+            // a migration (M12); here the harness is the migration.
+            shards: vec![0],
+        });
+    }
+
+    fn start(&mut self, spec: Spec) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = NodeConfig {
+            id: spec.id,
+            listen: "127.0.0.1:0".parse().unwrap(),
+            peers: spec.peers.iter().map(|&p| (p, format!("in-process://{p}"))).collect(),
+            data_dir: dir.path().to_path_buf(),
+            // Short but not degenerate: an election must complete in a test's
+            // patience, while still leaving a heartbeat comfortably inside the
+            // election timeout.
+            tick: Duration::from_millis(10),
+            election_timeout: 10,
+            heartbeat_interval: 2,
+            lease_reads: spec.lease_reads,
+            keydir: spec.keydir,
+            snapshot_threshold: spec.snapshot_threshold,
+            initial_learner: spec.joining,
+            num_shards: self.num_shards,
+            replication_factor: self.replication_factor,
+            vnodes_per_node: kv_ring::DEFAULT_VNODES,
+        };
+
+        // Two drivers, exactly as `main` runs them: the meta group alone in
+        // one, every shard group in the other.
+        let meta = self.start_driver(&spec, &config, &[group::META]);
+        let shard_groups: Vec<GroupId> = spec.shards.iter().copied().map(group::shard).collect();
+        let data = self.start_driver(&spec, &config, &shard_groups);
+
+        // The reconciler, exactly as `main` spawns it, but on a test-sized
+        // interval: the real one is slow on purpose (placement changes when an
+        // operator adds a machine), and a test should not wait out half a
+        // second per pass.
+        let published = PublishedMap::default();
+        tokio::spawn(
+            MetaReconciler::new(
+                config.clone(),
+                meta.1.clone(),
+                meta.0.clone(),
+                Arc::clone(&published),
+                Duration::from_millis(20),
+            )
+            .run(),
+        );
+
+        self.requests.insert(spec.id, data.0);
+        self.admin.insert(spec.id, data.1);
+        self.meta_requests.insert(spec.id, meta.0);
+        self.meta_admin.insert(spec.id, meta.1);
+        self.published.insert(spec.id, published);
+        self._dirs.push(dir);
+    }
+
+    /// Starts one driver hosting `groups` on one node. Returns its request and
+    /// admin senders; the inbox and reply senders are parked in `_keepalive`,
+    /// because dropping either closes a `select!` arm under the driver.
+    fn start_driver(
+        &mut self,
+        spec: &Spec,
+        config: &NodeConfig,
+        groups: &[GroupId],
+    ) -> (mpsc::Sender<ClientRequest>, mpsc::Sender<AdminRequest>) {
+        let (inbox_tx, inbox) = mpsc::channel(1024);
+        let (replies_tx, replies) = mpsc::channel(1024);
+        let (req_tx, req_rx) = mpsc::channel(64);
+        let (admin_tx, admin_rx) = mpsc::channel(16);
+        let (groups_tx, new_groups) = mpsc::channel(512);
+
+        let factory = TestPeers {
+            me: spec.id,
+            registry: Arc::clone(&self.registry),
+            my_replies: replies_tx.clone(),
+            switchboard: Arc::clone(&self.switchboard),
+        };
+        let peers: BTreeMap<NodeId, Box<dyn PeerLink>> = spec
+            .peers
+            .iter()
+            .map(|&p| (p, factory.connect(p, &format!("in-process://{p}"))))
+            .collect();
+
+        let mut hosted = Vec::new();
+        for &group in groups {
+            let (raft_dir, state_dir) = match group::shard_of(group) {
+                Some(shard) => (config.shard_raft_dir(shard), config.shard_state_dir(shard)),
+                None => (config.meta_raft_dir(), config.meta_state_dir()),
             };
-            std::fs::create_dir_all(config.raft_dir()).unwrap();
-            std::fs::create_dir_all(config.state_dir()).unwrap();
-            configs.insert(id, config);
-            dirs.push(dir);
+            std::fs::create_dir_all(&raft_dir).unwrap();
+            std::fs::create_dir_all(&state_dir).unwrap();
+
+            let mut raft = config.raft_config_for(group);
+            // A shard group's members are that shard's replica set, not the
+            // whole cluster — the same thing `shards::open` does when the
+            // supervisor founds one for real.
+            if let (Some(shard), Some(map)) = (group::shard_of(group), self.placement.as_ref()) {
+                raft.peers =
+                    map.replicas(shard).iter().copied().filter(|&p| p != spec.id).collect();
+            }
+            let node = RaftNode::new(raft, BitcaskStorage::open(&raft_dir).unwrap());
+            let engine = Engine::open_with_config(&state_dir, config.engine_config()).unwrap();
+            if group::shard_of(group) == Some(0) {
+                self.read_views.insert(spec.id, engine.read_view_factory());
+            }
+            // Registered before the driver runs: a peer that dials this node
+            // during its first tick must find an inbox, not a gap.
+            self.registry.register(spec.id, group, inbox_tx.clone());
+            hosted.push(Group::new(config, group, node, engine));
         }
 
-        // Inboxes first: a link needs its peer's inbox, so every inbox has to
-        // exist before any driver is built.
-        let mut inbox_tx = BTreeMap::new();
-        let mut inbox_rx = BTreeMap::new();
-        let mut replies_tx = BTreeMap::new();
-        let mut replies_rx = BTreeMap::new();
-        for &id in &ALL {
-            let (tx, rx) = mpsc::channel(256);
-            inbox_tx.insert(id, tx);
-            inbox_rx.insert(id, rx);
-            let (tx, rx) = mpsc::channel(256);
-            replies_tx.insert(id, tx);
-            replies_rx.insert(id, rx);
-        }
+        let driver = Driver::new(
+            config,
+            hosted,
+            peers,
+            Box::new(factory),
+            GroupChannels {
+                inbox,
+                peer_replies: replies,
+                requests: req_rx,
+                admin: admin_rx,
+                new_groups,
+            },
+        );
+        tokio::spawn(driver.run());
 
-        let mut requests = BTreeMap::new();
-        for &id in &ALL {
-            let config = &configs[&id];
-            let node = RaftNode::new(
-                config.raft_config(),
-                BitcaskStorage::open(config.raft_dir()).unwrap(),
-            );
-            let engine = Engine::open(config.state_dir()).unwrap();
-
-            let peers: BTreeMap<NodeId, Box<dyn PeerLink>> = ALL
-                .iter()
-                .filter(|&&p| p != id)
-                .map(|&p| {
-                    let link = TestLink {
-                        me: id,
-                        peer: p,
-                        peer_inbox: inbox_tx[&p].clone(),
-                        my_replies: replies_tx[&id].clone(),
-                        switchboard: Arc::clone(&switchboard),
-                    };
-                    (p, Box::new(link) as Box<dyn PeerLink>)
-                })
-                .collect();
-
-            let (req_tx, req_rx) = mpsc::channel(64);
-            let driver = Driver::new(
-                config,
-                node,
-                engine,
-                peers,
-                inbox_rx.remove(&id).unwrap(),
-                replies_rx.remove(&id).unwrap(),
-                req_rx,
-            );
-            tokio::spawn(driver.run());
-            requests.insert(id, req_tx);
-        }
-
-        Cluster { requests, switchboard, _dirs: dirs }
+        self._keepalive.push(Box::new((inbox_tx, replies_tx, groups_tx)));
+        (req_tx, admin_tx)
     }
 
     pub(crate) fn switchboard(&self) -> &Arc<Switchboard> {
         &self.switchboard
     }
 
+    /// Parks a reader inside node `id`'s published keydir copy until the
+    /// returned hold is dropped, which stops the driver's `publish` from
+    /// swapping the copies.
+    ///
+    /// The engine refuses to block a writer on a reader, so while this is
+    /// held the node goes on applying and acknowledging writes that no reader
+    /// can see. That is left-right's documented cost, and it is the only way
+    /// to make the window between *applied* and *visible* a fact rather than
+    /// a race a test passes by luck.
+    pub(crate) fn hold_read_copy(&self, id: NodeId) -> ReadHold {
+        self.read_views[&id].hold_read_copy()
+    }
+
+    /// A view of node `id`'s state machine as a reader sees it — published
+    /// state only, with no ReadIndex round trip. For asserting on what is
+    /// visible, never for serving a linearizable read.
+    pub(crate) fn read_view(&self, id: NodeId) -> kv_storage::ReadView {
+        self.read_views[&id].view()
+    }
+
+    /// A cloneable handle to the same nodes, for a test that drives client
+    /// traffic from one task while it administers the cluster from another.
+    pub(crate) fn client(&self) -> ClusterClient {
+        ClusterClient { requests: self.requests.clone() }
+    }
+
+    pub(crate) async fn call(&self, id: NodeId, op: ClientOp) -> ClientReply {
+        self.client().call(id, op).await
+    }
+
+    pub(crate) async fn try_call(
+        &self,
+        id: NodeId,
+        op: ClientOp,
+        within: Duration,
+    ) -> Option<ClientReply> {
+        self.client().try_call(id, op, within).await
+    }
+
+    pub(crate) async fn get_from(&self, id: NodeId, key: &[u8]) -> ClientReply {
+        self.client().get_from(id, key).await
+    }
+
+    pub(crate) async fn put_among(&self, among: &[NodeId], key: &[u8], value: &[u8]) -> NodeId {
+        self.client().put_among(among, key, value).await
+    }
+
+    pub(crate) async fn put(&self, key: &[u8], value: &[u8]) -> NodeId {
+        self.client().put_among(&ALL, key, value).await
+    }
+
+    pub(crate) async fn read_among(&self, among: &[NodeId], key: &[u8]) -> Option<Vec<u8>> {
+        self.client().read_among(among, key).await
+    }
+
+    pub(crate) async fn read(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.client().read_among(&ALL, key).await
+    }
+
+    pub(crate) async fn leader_of(&self, among: &[NodeId]) -> Option<NodeId> {
+        self.client().leader_of(among).await
+    }
+
+    /// The map node `id` has published, once it has published one.
+    pub(crate) async fn await_shard_map_on(
+        &self,
+        id: NodeId,
+        within: Duration,
+    ) -> Option<Arc<ShardMap>> {
+        let deadline = std::time::Instant::now() + within;
+        while std::time::Instant::now() < deadline {
+            if let Some(map) = self.published[&id].load_full() {
+                return Some(map);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        None
+    }
+
+    /// The map as any node sees it. For assertions about the map's content
+    /// rather than about agreement; `await_shard_map_on` is the per-node form.
+    pub(crate) async fn await_shard_map(&self, within: Duration) -> Option<Arc<ShardMap>> {
+        self.await_shard_map_on(ALL[0], within).await
+    }
+
+    /// One client request to a node's **meta** group.
+    pub(crate) async fn meta_call(&self, id: NodeId, op: ClientOp) -> ClientReply {
+        let (reply, wait) = oneshot::channel();
+        self.meta_requests[&id]
+            .send(ClientRequest { group: group::META, op, reply })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), wait)
+            .await
+            .expect("the meta driver answers")
+            .expect("the meta driver does not drop it")
+    }
+
+    /// A meta-group client request that may go unanswered — the meta
+    /// equivalent of `try_call`, for asking a partitioned node something it
+    /// cannot honestly answer.
+    pub(crate) async fn try_meta_call(
+        &self,
+        id: NodeId,
+        op: ClientOp,
+        within: Duration,
+    ) -> Option<ClientReply> {
+        let (reply, wait) = oneshot::channel();
+        self.meta_requests[&id].send(ClientRequest { group: group::META, op, reply }).await.ok()?;
+        tokio::time::timeout(within, wait).await.ok()?.ok()
+    }
+
+    /// One admin request to a node's meta group.
+    pub(crate) async fn meta_admin(&self, id: NodeId, op: AdminOp) -> AdminReply {
+        let (reply, wait) = oneshot::channel();
+        self.meta_admin[&id].send(AdminRequest { group: group::META, op, reply }).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), wait)
+            .await
+            .expect("the meta driver answers an admin request")
+            .expect("the meta driver does not drop it")
+    }
+
+    pub(crate) async fn meta_status_of(&self, id: NodeId) -> ClusterStatus {
+        match self.meta_admin(id, AdminOp::Status).await {
+            AdminReply::Status(status) => status,
+            other => panic!("node {id}'s meta group answered a status request with {other:?}"),
+        }
+    }
+
+    /// Whichever of `among` leads the meta group, once one does.
+    pub(crate) async fn meta_leader_of(&self, among: &[NodeId]) -> Option<NodeId> {
+        for _ in 0..200 {
+            for &id in among {
+                let status = self.meta_status_of(id).await;
+                if let Some(leader) = status.leader
+                    && among.contains(&leader)
+                {
+                    return Some(leader);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        None
+    }
+
+    /// One admin request to one node, no retry.
+    pub(crate) async fn admin(&self, id: NodeId, op: AdminOp) -> AdminReply {
+        let (reply, wait) = oneshot::channel();
+        self.admin[&id].send(AdminRequest { group: group::DATA, op, reply }).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), wait)
+            .await
+            .expect("the driver answers an admin request")
+            .expect("the driver does not drop it")
+    }
+
+    pub(crate) async fn status_of(&self, id: NodeId) -> ClusterStatus {
+        match self.admin(id, AdminOp::Status).await {
+            AdminReply::Status(status) => status,
+            other => panic!("node {id} answered a status request with {other:?}"),
+        }
+    }
+
+    /// Runs a membership change against whichever of `among` leads, retrying
+    /// through `NotLeader` exactly as an admin tool does.
+    ///
+    /// A `Rejected` is returned rather than retried: it means the change is
+    /// wrong wherever it is sent.
+    pub(crate) async fn administer(
+        &self,
+        among: &[NodeId],
+        op: impl Fn() -> AdminOp,
+    ) -> AdminReply {
+        for _ in 0..200 {
+            for &id in among {
+                match self.admin(id, op()).await {
+                    AdminReply::NotLeader { .. } => {}
+                    answered => return answered,
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("no node among {among:?} accepted a membership change in 4s");
+    }
+
+    /// Runs a membership change against whichever of `among` leads the
+    /// **meta** group.
+    ///
+    /// Since M11 this is what "the cluster's membership" means: there is no
+    /// single data group any more, so the small fixed group that records
+    /// placement records who is in the cluster too, and the ring is built from
+    /// its members.
+    pub(crate) async fn administer_meta(
+        &self,
+        among: &[NodeId],
+        op: impl Fn() -> AdminOp,
+    ) -> AdminReply {
+        for _ in 0..200 {
+            for &id in among {
+                match self.meta_admin(id, op()).await {
+                    AdminReply::NotLeader { .. } => {}
+                    answered => return answered,
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("no node among {among:?} accepted a meta membership change in 4s");
+    }
+
+    /// Waits until `id` reports exactly `voters`. Returns false on timeout, so
+    /// the caller can assert with its own message.
+    pub(crate) async fn await_voters(
+        &self,
+        id: NodeId,
+        voters: &[NodeId],
+        within: Duration,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + within;
+        let want: Vec<NodeId> = voters.to_vec();
+        while std::time::Instant::now() < deadline {
+            if self.status_of(id).await.voters == want {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    /// Every shard group `id` hosts, as that node sees them (M11.6).
+    pub(crate) async fn shard_statuses_of(&self, id: NodeId) -> Vec<ShardStatus> {
+        let (reply, wait) = oneshot::channel();
+        self.admin[&id]
+            .send(AdminRequest { group: group::UNSET, op: AdminOp::ShardStatuses, reply })
+            .await
+            .unwrap();
+        match tokio::time::timeout(Duration::from_secs(10), wait)
+            .await
+            .expect("the shard driver answers")
+            .expect("the shard driver does not drop it")
+        {
+            AdminReply::ShardStatuses(statuses) => statuses,
+            other => panic!("node {id} answered a shard-status request with {other:?}"),
+        }
+    }
+
+    /// Who leads each shard, once every shard has a leader among the nodes in
+    /// `among`.
+    ///
+    /// Asked of each shard's own replicas, because a node that does not host a
+    /// shard has no view of it at all — which is the point of sharding.
+    pub(crate) async fn await_shard_leaders(
+        &self,
+        among: &[NodeId],
+        within: Duration,
+    ) -> BTreeMap<ShardId, NodeId> {
+        let deadline = std::time::Instant::now() + within;
+        let map = self.placement().clone();
+        loop {
+            let mut leaders = BTreeMap::new();
+            for &id in among {
+                for status in self.shard_statuses_of(id).await {
+                    if status.leading {
+                        leaders.insert(status.shard, id);
+                    }
+                }
+            }
+            let complete = (0..map.num_shards)
+                .filter(|&shard| map.replicas(shard).iter().any(|r| among.contains(r)))
+                .all(|shard| leaders.contains_key(&shard));
+            if complete {
+                return leaders;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("not every shard elected a leader among {among:?}; got {leaders:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Writes `key` to its shard, trying that shard's replicas in turn.
+    ///
+    /// Returns the node that accepted it, or `None` if none did inside
+    /// `within` — which is what "this shard is degraded" looks like from
+    /// outside.
+    pub(crate) async fn write_to_shard_with(
+        &self,
+        map: &ShardMap,
+        key: &[u8],
+        value: &[u8],
+        among: &[NodeId],
+        within: Duration,
+    ) -> Option<NodeId> {
+        self.client().write_to_shard_with(map, key, value, among, within).await
+    }
+
+    /// Real time passes here, so a wait is a real wait.
+    pub(crate) async fn settle(&self, how_long: Duration) {
+        tokio::time::sleep(how_long).await;
+    }
+}
+
+/// The client half of the harness, detached from the nodes so it can be moved
+/// into a task of its own.
+#[derive(Clone)]
+pub(crate) struct ClusterClient {
+    requests: BTreeMap<NodeId, mpsc::Sender<ClientRequest>>,
+}
+
+impl ClusterClient {
+    /// Writes `key` to its shard, trying that shard's replicas in turn.
+    ///
+    /// Takes the map explicitly rather than reading the cluster's, so the
+    /// whole call is `Send` and one shard's write can run in its own task
+    /// beside every other shard's — which is how the gate shows that they
+    /// proceed concurrently rather than queueing behind one leader.
+    pub(crate) async fn write_to_shard_with(
+        &self,
+        map: &ShardMap,
+        key: &[u8],
+        value: &[u8],
+        among: &[NodeId],
+        within: Duration,
+    ) -> Option<NodeId> {
+        let shard = map.shard_for_key(key);
+        let group = group::shard(shard);
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            for &id in map.replicas(shard) {
+                if !among.contains(&id) {
+                    continue;
+                }
+                let (reply, wait) = oneshot::channel();
+                let op = ClientOp::Mutate {
+                    ctx: None,
+                    op: crate::command::Mutation::Put { key: key.to_vec(), value: value.to_vec() },
+                };
+                if self.requests[&id].send(ClientRequest { group, op, reply }).await.is_err() {
+                    continue;
+                }
+                if let Ok(Ok(ClientReply::Applied)) =
+                    tokio::time::timeout(Duration::from_millis(500), wait).await
+                {
+                    return Some(id);
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     /// One request to one node, no retry.
     pub(crate) async fn call(&self, id: NodeId, op: ClientOp) -> ClientReply {
         let (reply, wait) = oneshot::channel();
-        self.requests[&id].send(ClientRequest { op, reply }).await.unwrap();
+        self.requests[&id].send(ClientRequest { group: group::DATA, op, reply }).await.unwrap();
         tokio::time::timeout(Duration::from_secs(10), wait)
             .await
             .expect("the driver answers")
@@ -227,7 +887,7 @@ impl Cluster {
         within: Duration,
     ) -> Option<ClientReply> {
         let (reply, wait) = oneshot::channel();
-        self.requests[&id].send(ClientRequest { op, reply }).await.unwrap();
+        self.requests[&id].send(ClientRequest { group: group::DATA, op, reply }).await.unwrap();
         tokio::time::timeout(within, wait).await.ok().map(|r| r.expect("not dropped"))
     }
 
@@ -250,10 +910,6 @@ impl Cluster {
         panic!("no node among {among:?} accepted a write in 4s");
     }
 
-    pub(crate) async fn put(&self, key: &[u8], value: &[u8]) -> NodeId {
-        self.put_among(&ALL, key, value).await
-    }
-
     /// Reads via whichever of `among` can serve it, retrying through
     /// `NotLeader`. Since M7 that is the leader alone: a linearizable read
     /// needs a leadership quorum, so a follower refuses rather than answering
@@ -270,10 +926,6 @@ impl Cluster {
         panic!("no node among {among:?} served a read in 4s");
     }
 
-    pub(crate) async fn read(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.read_among(&ALL, key).await
-    }
-
     /// Which of `among` currently leads, found by asking each to serve a read:
     /// since M7 only a leader that can confirm a quorum will.
     pub(crate) async fn leader_of(&self, among: &[NodeId]) -> Option<NodeId> {
@@ -286,11 +938,6 @@ impl Cluster {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         None
-    }
-
-    /// Real time passes here, so a wait is a real wait.
-    pub(crate) async fn settle(&self, how_long: Duration) {
-        tokio::time::sleep(how_long).await;
     }
 }
 

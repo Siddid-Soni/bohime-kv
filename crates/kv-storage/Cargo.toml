@@ -15,11 +15,30 @@ tracing.workspace = true
 left-right.workspace = true
 
 [dev-dependencies]
+libc.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
 criterion.workspace = true
+dashmap.workspace = true
 loom.workspace = true
 
 [[bench]]
 name = "engine"
 harness = false
+
+[[bench]]
+name = "read_scaling"
+harness = false
+
+[[bench]]
+name = "index_scaling"
+harness = false
+
+# `loom` is a deliberate, separately-run configuration: `RUSTFLAGS="--cfg loom"
+# cargo test -p kv-storage --lib` builds left-right against loom's atomics so
+# the model can actually explore its interleavings. Declared so the ordinary
+# build does not warn about the cfg it never sets.
+[lints.rust.unexpected_cfgs]
+level = "warn"
+priority = 0
+check-cfg = ["cfg(loom)"]

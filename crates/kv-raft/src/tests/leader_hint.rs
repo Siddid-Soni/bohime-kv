@@ -7,7 +7,14 @@ use crate::node::RaftNode;
 use crate::storage::MemStorage;
 
 fn config(id: u64, peers: Vec<u64>) -> Config {
-    Config { id, peers, election_timeout: 10, heartbeat_interval: 2, seed: id }
+    Config {
+        id,
+        peers,
+        election_timeout: 10,
+        heartbeat_interval: 2,
+        seed: id,
+        initial_learner: false,
+    }
 }
 
 fn append_from(leader: u64, term: u64) -> Message {

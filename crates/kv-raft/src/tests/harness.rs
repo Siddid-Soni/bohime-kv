@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use crate::types::NodeId;
 
 pub fn config(id: NodeId, peers: Vec<NodeId>, seed: u64) -> Config {
-    Config { id, peers, election_timeout: 10, heartbeat_interval: 2, seed }
+    Config { id, peers, election_timeout: 10, heartbeat_interval: 2, seed, initial_learner: false }
 }
 
 pub struct Cluster {
