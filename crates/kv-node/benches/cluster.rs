@@ -40,7 +40,10 @@
 //!   A read still takes a ReadIndex quorum round trip but touches no disk on
 //!   the write path, so it bounds how much of the write number is the client,
 //!   the runtime and gRPC rather than durability. If reads and writes come out
-//!   equal, the bottleneck is the harness.
+//!   equal, the bottleneck is the harness. It reads back what the write arm
+//!   wrote and asserts on a miss — see `keys`, and note that every read number
+//!   published before 2026-09-18 was taken against keys that had never been
+//!   written.
 //! - **`--log-fsync never`** — run the whole sweep a second time with
 //!   `BOHIME_BENCH_FSYNC=never`. That arm is the no-durability ceiling for the
 //!   real code path. Group commit has to move the default arm *toward* it and
@@ -73,15 +76,27 @@
 //! and not pipelining was the first lever.
 //!
 //! The 64-shard point falling below the 8-shard point is a *different*
-//! bottleneck, and the `get` arm shows it plainly: reads go 14.4k → 8.9k →
-//! 2.2k op/s over the same sweep, touching no disk at all. That is the shared
-//! tick loop's per-group cost, not durability.
+//! bottleneck. The `get` arm appeared to show it plainly — reads went
+//! 14.4k → 8.9k → 2.2k op/s over the same sweep, touching no disk at all —
+//! and that was read as the shared tick loop's per-group cost. **It was not.**
+//! It was this harness's own cold clients paying `kv-client`'s 50 ms retry
+//! pause once per shard they had to learn a leader for, and the driver loop
+//! spends 0.2% of itself on all 64 groups. See
+//! `docs/superpowers/plans/2026-09-18-tick-loop.md`. The write arm's turnover
+//! is the fsync budget: with `BOHIME_BENCH_DIR=/tmp` it is 83 → 615 → 3295,
+//! rising 39.7× with no turnover at all.
+//!
+//! Which is the standing lesson for this file: a number taken with a fixed
+//! client count across a rising shard count is measuring the *load generator*
+//! as much as the system, and the first thing to do with any curve here is
+//! re-run it with `BOHIME_BENCH_CLIENTS` swept.
 //!
 //! ## Running it
 //!
 //! ```text
 //! cargo bench -p kv-node --bench cluster
-//! BOHIME_BENCH_SHARDS=1,8,64 BOHIME_BENCH_CLIENTS=32 cargo bench -p kv-node --bench cluster
+//! BOHIME_BENCH_SHARDS=1,8,64 BOHIME_BENCH_CLIENTS=32,128,512 cargo bench -p kv-node --bench cluster
+//! BOHIME_BENCH_ARMS=get cargo bench -p kv-node --bench cluster   # reads only
 //! BOHIME_BENCH_FSYNC=every-write cargo bench -p kv-node --bench cluster
 //! BOHIME_BENCH_DIR=/tmp cargo bench -p kv-node --bench cluster   # control only
 //! ```
@@ -324,8 +339,20 @@ where
 {
     let mut handles = Vec::with_capacity(clients);
     let start = Instant::now();
+    // The client's per-attempt deadline, overridable because it is the term
+    // that decides where the closed-loop curve breaks: a fixed pool of
+    // `clients` breaks when queueing delay crosses it, which by Little's law
+    // is at `throughput * deadline` concurrent requests and not before.
+    let deadline = std::env::var("BOHIME_BENCH_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(Duration::from_millis);
     for c in 0..clients {
         let client = Client::new(endpoints.to_vec());
+        let client = match deadline {
+            Some(d) => client.with_request_timeout(d),
+            None => client,
+        };
         let op = op.clone();
         handles.push(tokio::spawn(async move { op(client, c, ops).await }));
     }
@@ -336,19 +363,34 @@ where
     Sample { elapsed: start.elapsed(), latencies_us: latencies }
 }
 
-/// `phase` separates the warmup key space from the timed one so a timed write
-/// is always a fresh key rather than an overwrite of a key the engine already
-/// has a keydir slot for.
+/// The key stream one client writes and then reads back.
+///
+/// **Its own generator**, drawing nothing else from it, and that is the point.
+/// Both arms used to share one `Rng` per client and take the key from it —
+/// but `put_load` also drew 256 bytes of value from that same stream before
+/// each key, so the two arms walked it at different strides and the read arm
+/// asked for keys that were never written. Every "get (control)" number
+/// before 2026-09-18 is a miss rate of 100%: a real ReadIndex round trip and
+/// a real keydir lookup, but never a value off the disk.
+///
+/// Randomised rather than sequential: sequential keys under one client would
+/// land in one shard and the shard sweep would measure nothing. `phase`
+/// separates the warmup key space from the timed one, so a timed write is a
+/// fresh key rather than an overwrite of a slot the keydir already has.
+fn keys(c: usize, phase: u64) -> Rng {
+    Rng(0x243F_6A88_85A3_08D3
+        ^ phase.wrapping_mul(0xD1B5_4A32_D192_ED03)
+        ^ (c as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+}
+
 async fn put_load(mut client: Client, c: usize, ops: usize, phase: u64) -> Vec<u64> {
-    let mut rng = Rng(0x243F_6A88_85A3_08D3 ^ (c as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    let mut keys = keys(c, phase);
+    let mut values = Rng(0xA076_1D64_78BD_642F ^ (c as u64).wrapping_mul(0xE703_7ED1_A0B4_28DB));
     let mut value = vec![0u8; VALUE_LEN];
     let mut out = Vec::with_capacity(ops);
     for i in 0..ops {
-        rng.fill(&mut value);
-        // The key is randomised, not sequential: sequential keys under one
-        // client would land in one shard and the shard sweep would measure
-        // nothing.
-        let key = format!("bench/{phase}/{c}/{:016x}", rng.next());
+        values.fill(&mut value);
+        let key = format!("bench/{phase}/{c}/{:016x}", keys.next());
         let t = Instant::now();
         client.put(key.as_bytes(), &value).await.unwrap_or_else(|e| {
             panic!("put {i} from client {c} failed: {e}");
@@ -358,14 +400,17 @@ async fn put_load(mut client: Client, c: usize, ops: usize, phase: u64) -> Vec<u
     out
 }
 
+/// Reads back what `put_load` wrote for the same client and phase, in the
+/// same order. A miss is a bug in the harness, not a result, so it asserts.
 async fn get_load(mut client: Client, c: usize, ops: usize, phase: u64) -> Vec<u64> {
-    let mut rng = Rng(0x243F_6A88_85A3_08D3 ^ (c as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    let mut keys = keys(c, phase);
     let mut out = Vec::with_capacity(ops);
-    for _ in 0..ops {
-        let key = format!("bench/{phase}/{c}/{:016x}", rng.next());
+    for i in 0..ops {
+        let key = format!("bench/{phase}/{c}/{:016x}", keys.next());
         let t = Instant::now();
-        let _ = client.get(key.as_bytes()).await.expect("get succeeds");
+        let got = client.get(key.as_bytes()).await.expect("get succeeds");
         out.push(t.elapsed().as_micros() as u64);
+        assert!(got.is_some(), "get {i} from client {c} missed a key the put arm wrote");
     }
     out
 }
@@ -419,11 +464,39 @@ fn filesystem_of(path: &Path) -> String {
     best.map(|(_, s)| s).unwrap_or_else(|| "unknown".into())
 }
 
+/// Which arms to run, in `BOHIME_BENCH_ARMS` (default both).
+///
+/// The read arm is the one that isolates the driver loop — it takes a
+/// ReadIndex quorum round trip and touches no disk — so a sweep hunting a
+/// per-group cost wants `BOHIME_BENCH_ARMS=get` and not to spend minutes a
+/// point on `fdatasync`.
+fn arms() -> (bool, bool) {
+    match std::env::var("BOHIME_BENCH_ARMS") {
+        Ok(v) => {
+            let list: Vec<&str> = v.split(',').map(|s| s.trim()).collect();
+            (list.contains(&"put"), list.contains(&"get"))
+        }
+        Err(_) => (true, true),
+    }
+}
+
+/// Client counts to sweep at each shard count, in `BOHIME_BENCH_CLIENTS`
+/// (comma-separated). Holding one client count fixed while shard count rises
+/// starves the added groups of offered load, so a shard curve taken that way
+/// measures the methodology as much as the system.
+fn client_counts() -> Vec<usize> {
+    match std::env::var("BOHIME_BENCH_CLIENTS") {
+        Ok(v) => v.split(',').filter_map(|s| s.trim().parse().ok()).collect(),
+        Err(_) => vec![32],
+    }
+}
+
 fn main() {
-    let clients = env_usize("BOHIME_BENCH_CLIENTS", 32);
+    let client_counts = client_counts();
     let ops = env_usize("BOHIME_BENCH_OPS", OPS_PER_CLIENT);
     let fsync = std::env::var("BOHIME_BENCH_FSYNC").ok();
     let shards = shard_counts();
+    let (do_put, do_get) = arms();
 
     let root = bench_root();
     std::fs::create_dir_all(&root).unwrap();
@@ -432,7 +505,8 @@ fn main() {
     println!("data directory : {}", root.display());
     println!("filesystem     : {}", filesystem_of(&root));
     println!("nodes          : {NODES} processes, RF 3, loopback gRPC");
-    println!("load           : {clients} concurrent clients x {ops} ops, {VALUE_LEN}B values");
+    println!("load           : clients {client_counts:?} x {ops} ops, {VALUE_LEN}B values");
+    println!("arms           : put={do_put} get={do_get}");
     match &fsync {
         Some(p) => println!("log fsync      : --log-fsync {p}"),
         None => println!("log fsync      : (flag not passed; the binary's default)"),
@@ -453,20 +527,42 @@ fn main() {
             // cold cluster, so the first successful put is the signal that
             // the meta group elected, published a placement, and the shard
             // groups founded and elected in turn.
-            let warm = drive(&cluster.endpoints, clients, WARMUP_PER_CLIENT, |c, i, o| {
-                put_load(c, i, o, 0)
-            })
-            .await;
+            let warm =
+                drive(&cluster.endpoints, 32, WARMUP_PER_CLIENT, |c, i, o| put_load(c, i, o, 0))
+                    .await;
             println!("  (warmup {} ops in {:.2}s)", warm.ops(), warm.elapsed.as_secs_f64());
 
-            let puts =
-                drive(&cluster.endpoints, clients, ops, |c, i, o| put_load(c, i, o, 1)).await;
-            puts.report("put");
-
-            // The read arm reads back phase-1 keys, so every one is a hit.
-            let gets =
-                drive(&cluster.endpoints, clients, ops, |c, i, o| get_load(c, i, o, 1)).await;
-            gets.report("get (control)");
+            for (i, &clients) in client_counts.iter().enumerate() {
+                // Each client count gets its own phase, so a timed write is
+                // always a fresh key and the read arm has exactly the keys
+                // this client count wrote.
+                let phase = i as u64 + 1;
+                // The read arm reads back what the write arm wrote, so the
+                // write has to happen even when only the read is being
+                // measured — untimed, and only as far as this arm will read.
+                if do_put || do_get {
+                    let puts = drive(&cluster.endpoints, clients, ops, move |c, i, o| {
+                        put_load(c, i, o, phase)
+                    })
+                    .await;
+                    if do_put {
+                        puts.report(&format!("put   c={clients}"));
+                    } else {
+                        println!(
+                            "  (prefill {} ops in {:.2}s)",
+                            puts.ops(),
+                            puts.elapsed.as_secs_f64()
+                        );
+                    }
+                }
+                if do_get {
+                    let gets = drive(&cluster.endpoints, clients, ops, move |c, i, o| {
+                        get_load(c, i, o, phase)
+                    })
+                    .await;
+                    gets.report(&format!("get   c={clients}"));
+                }
+            }
         });
         println!();
         drop(cluster);

@@ -1,11 +1,10 @@
 pub(crate) mod cluster;
-pub(crate) mod support;
-
 mod command;
 mod config;
 mod convert;
 mod driver;
 mod end_to_end;
+mod expiry;
 mod group;
 mod group_commit;
 mod linearizability;
@@ -24,5 +23,6 @@ mod shards;
 mod snapshot;
 mod storage;
 mod storage_equivalence;
+pub(crate) mod support;
 mod transport;
 mod wait_free_reads;

@@ -98,6 +98,44 @@ pub enum ClientReply {
     },
 }
 
+/// What to do with a pending request that outlived its deadline.
+///
+/// Expiry says only that this request waited longer than a leader in good
+/// health takes. It does not say *why*, and the two reasons want opposite
+/// answers:
+///
+/// - **Partitioned.** This node still believes it leads, but no quorum
+///   will ever confirm it, so nothing it accepts can commit. The client
+///   has to go and find the real leader, so answer `NotLeader`.
+/// - **Behind.** It really is the leader and really is committing; this
+///   request is just behind a backlog. `NotLeader` here is a lie with a
+///   feedback loop attached — the client re-searches, is pointed back at
+///   this same node, and re-proposes, so the one signal that the node was
+///   overloaded doubles its offered load. That is the congestion collapse
+///   measured at 64 shards: on tmpfs, with no disk in the picture at all,
+///   throughput fell 5170 -> 3019 -> 1665 -> 784 op/s as clients went
+///   64 -> 128 -> 256 -> 512, and `NotLeader` replies per operation went
+///   from 0.43 to 1.11 across the same range.
+///
+/// A commit index that moved inside the last `request_timeout` is what
+/// separates them: a partitioned leader's cannot move at all.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Expiry {
+    /// Leave the request pending. This leader is committing and will get to
+    /// it; giving up on it here does not withdraw the entry already proposed.
+    Wait,
+    /// Answer `NotLeader`. Nothing this node accepted can ever commit.
+    Redirect,
+}
+
+pub(crate) fn expiry_decision(
+    leading: bool,
+    since_commit: Duration,
+    request_timeout: Duration,
+) -> Expiry {
+    if leading && since_commit < request_timeout { Expiry::Wait } else { Expiry::Redirect }
+}
+
 impl From<CommandResponse> for ClientReply {
     fn from(response: CommandResponse) -> Self {
         match response {
@@ -331,6 +369,12 @@ pub struct Group {
     /// and a write never commits — without a deadline both hang forever and
     /// the client cannot tell that from slowness.
     request_timeout: Duration,
+    /// The commit index last seen to move, and when. Together they are how
+    /// this group tells *partitioned* from *behind* when a request expires:
+    /// a leader that cannot reach a quorum cannot commit anything, and one
+    /// that is merely overloaded commits continuously. See `expiry_decision`.
+    last_commit_index: LogIndex,
+    last_commit_at: Instant,
     /// §1.10's lease reads, off unless asked for. When on, a leader that has
     /// recently had a quorum confirm it may serve reads with **no** round trip
     /// at all — correct only while clock drift stays inside the margin, which
@@ -448,6 +492,8 @@ impl Group {
             // Comfortably longer than an election, so an ordinary failover is
             // ridden out rather than reported as a failure.
             request_timeout: config.tick * (config.election_timeout as u32) * 6,
+            last_commit_index: 0,
+            last_commit_at: Instant::now(),
             lease_reads: config.lease_reads,
             lease_duration: config.lease_duration(),
             lease_until: None,
@@ -916,6 +962,10 @@ impl Group {
             return;
         }
         let commit = self.node.commit_index();
+        if commit > self.last_commit_index {
+            self.last_commit_index = commit;
+            self.last_commit_at = Instant::now();
+        }
         let ready: Option<NodeId> = self
             .node
             .cluster_config()
@@ -1038,9 +1088,27 @@ impl Group {
     /// `read_index` starts a round, but neither can ever reach a quorum. The
     /// node has no way to learn this — Raft leaders do not step down on their
     /// own — so without a deadline the client waits forever.
+    fn expiry_decision(&self, now: Instant) -> Expiry {
+        expiry_decision(
+            self.node.role() == kv_raft::Role::Leader,
+            now.duration_since(self.last_commit_at),
+            self.request_timeout,
+        )
+    }
+
     fn expire_stale_requests(&mut self) {
         let now = Instant::now();
         let hint = self.node.leader_id();
+        // A leader that is still committing will get to this request. Expiring
+        // it does not withdraw the log entry it already proposed — that entry
+        // commits either way — it only tells the client to send another one,
+        // which the session table then has to dedup at apply time. Under
+        // overload every request expires, so the deadline turns a backlog into
+        // a duplicate for every entry in it. Let them wait; the client has its
+        // own deadline and is the only party that can actually give up.
+        if self.expiry_decision(now) == Expiry::Wait {
+            return;
+        }
 
         let expired: Vec<LogIndex> =
             self.pending.iter().filter(|(_, p)| p.deadline <= now).map(|(i, _)| *i).collect();

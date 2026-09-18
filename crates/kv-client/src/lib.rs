@@ -17,7 +17,7 @@
 
 pub mod cli;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use kv_proto::admin::admin_service_client::AdminServiceClient;
@@ -66,8 +66,28 @@ impl Placement {
 /// normally as unreachable — which is the wrong answer, and the one an
 /// operator sees on their first write after bringing a cluster up.
 const RETRY_ROUNDS: usize = 120;
+/// What a round costs when it learned nothing.
+///
+/// Every node this client could reach refused and none of them named a
+/// leader: there is nothing to act on, so the next round is a guess and
+/// pacing it is the only thing that helps. A round that ends holding a
+/// **hint** is the opposite — a node just answered and said where to go —
+/// and it does not pay this. Sleeping on a hint turned every leader-cache
+/// miss into 50 ms, and a fresh client has one of those per shard it
+/// touches; see `tests::redirect`.
 const RETRY_PAUSE: Duration = Duration::from_millis(50);
+/// How many times `RETRY_PAUSE` may double while rounds keep coming back with
+/// nothing to act on.
+///
+/// A node that sheds is a node that is already doing more than it can. Asking
+/// it again on the same fixed interval is the client's contribution to the
+/// overload, and with `RETRY_ROUNDS` of them it is a large one. Three
+/// doublings caps a round at 400 ms, which is long enough to be out of the
+/// way and short enough that a cluster recovering from a failover is noticed
+/// promptly.
+const BACKOFF_DOUBLINGS: u32 = 3;
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
+/// The default for `Client::with_request_timeout`.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// One variant, because the client's contract is "retry until a node accepts
@@ -114,6 +134,85 @@ pub struct Client {
     /// request — that is the entire mechanism: a retry that picked a fresh
     /// number would be a new request and would apply a second time.
     sequence: u64,
+    /// How long one attempt may take before the client stops waiting on it.
+    ///
+    /// Enforced here rather than on the `Endpoint`, and that is deliberate:
+    /// `Endpoint::timeout` surfaces as `Code::Unknown` with the message
+    /// "transport error", indistinguishable from a connection that actually
+    /// broke. The client has to tell those apart — one of them means the node
+    /// is busy and the other means it is gone — so it owns the clock.
+    request_timeout: Duration,
+}
+
+/// The pacing state of one request's retry loop.
+///
+/// Separate from `Client` because it is per *request*, not per client: a hint
+/// followed once is spent for this request and fresh for the next one.
+#[derive(Default)]
+struct Pacing {
+    /// Hints already taken up during this request. A hint chased twice is a
+    /// loop, not progress — two nodes pointing at each other is what a client
+    /// sees for a moment after a failover.
+    followed: BTreeSet<NodeId>,
+    /// Consecutive rounds in which a node said it was too busy. Drives the
+    /// backoff, and resets the moment anything useful arrives.
+    ///
+    /// Only *backpressure* counts here. A round in which nothing was reachable
+    /// at all is the other failure, and it keeps the flat `RETRY_PAUSE`: a
+    /// cluster that is down does not get less down if the client waits
+    /// longer, and backing off there would only slow down saying so.
+    busy_rounds: u32,
+}
+
+/// Why an attempt produced no answer, and what the client should keep.
+///
+/// The client used to have one arm for every `tonic::Status`, and it dropped
+/// the channel **and** the per-shard leader cache. Under load that put every
+/// client back into cold start — redial, re-search, arrive at the same
+/// saturated node — so offered load rose exactly when the cluster could least
+/// absorb it. See `tests::backpressure`.
+enum Refusal {
+    /// Reachable, and could not serve *this attempt*: it shed the request, or
+    /// it did not answer inside the deadline. The connection is good and the
+    /// node is very likely still the leader. Keep both; wait longer.
+    Busy(String),
+    /// The connection is no good. Drop it, so the next attempt redials rather
+    /// than reusing a socket to a process that is gone.
+    Gone(String),
+}
+
+impl Refusal {
+    fn message(&self) -> &str {
+        match self {
+            Refusal::Busy(m) | Refusal::Gone(m) => m,
+        }
+    }
+}
+
+/// One attempt, bounded by the client's own clock.
+///
+/// The deadline is enforced here rather than by `Endpoint::timeout` because
+/// tower's elapsed error reaches us as `Code::Unknown` with the message
+/// "transport error" — the same thing a genuinely broken connection produces.
+/// Telling a slow node from a dead one is the entire point, so the client
+/// cannot afford to have those collapsed into one status by the layer below.
+async fn attempt<T, F>(deadline: Duration, call: F) -> Result<T, Refusal>
+where
+    F: std::future::Future<Output = Result<tonic::Response<T>, tonic::Status>>,
+{
+    match tokio::time::timeout(deadline, call).await {
+        Err(_) => Err(Refusal::Busy(format!("no answer within {deadline:?}"))),
+        Ok(Ok(response)) => Ok(response.into_inner()),
+        Ok(Err(status)) => Err(match status.code() {
+            // Backpressure, not failure: `kv_service.rs` sheds a full request
+            // queue rather than awaiting it, precisely so that the gRPC layer
+            // cannot pin unbounded memory behind a busy driver. A client that
+            // reads that as "this node is broken" turns the one mechanism
+            // protecting the server into the thing overwhelming it.
+            tonic::Code::ResourceExhausted => Refusal::Busy(status.to_string()),
+            _ => Refusal::Gone(status.to_string()),
+        }),
+    }
 }
 
 impl Client {
@@ -126,11 +225,25 @@ impl Client {
             leaders: BTreeMap::new(),
             client_id: rand::random(),
             sequence: 0,
+            request_timeout: REQUEST_TIMEOUT,
         }
+    }
+
+    /// How long one attempt may take. The default is `REQUEST_TIMEOUT`.
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
+        self
     }
 
     pub fn leader(&self) -> Option<NodeId> {
         self.leader
+    }
+
+    /// Whether a channel to `id` is still cached. Test-only: what it observes
+    /// is that a failure was classified as fatal to the connection.
+    #[cfg(test)]
+    pub(crate) fn holds_channel(&self, id: NodeId) -> bool {
+        self.channels.contains_key(&id)
     }
 
     /// The order to try nodes in for `key`: the shard's cached leader first,
@@ -240,6 +353,35 @@ impl Client {
         }
     }
 
+    /// Paces the retry loop between rounds, and returns having done so.
+    ///
+    /// A hint is progress: some node answered and named the next one to ask,
+    /// so the round found something out and the next one starts immediately.
+    /// A hint we have **already followed for this request** is not progress —
+    /// two nodes pointing at each other is what a client sees for a moment
+    /// after a failover, and chasing that at loopback speed would burn the
+    /// whole retry budget in the time one pause takes. So each node is worth
+    /// one free hop per request, and after that the loop paces itself again.
+    async fn pace(&self, hinted: Option<NodeId>, busy: bool, pacing: &mut Pacing) {
+        // A hint this request has not taken up yet is progress: a node just
+        // answered and said where to go. Sleeping before acting on it turned
+        // every leader-cache miss into a `RETRY_PAUSE`, and a fresh client has
+        // one of those per shard it touches. See `tests::redirect`.
+        if let Some(id) = hinted
+            && pacing.followed.insert(id)
+        {
+            pacing.busy_rounds = 0;
+            return;
+        }
+        if !busy {
+            pacing.busy_rounds = 0;
+            tokio::time::sleep(RETRY_PAUSE).await;
+            return;
+        }
+        let pause = RETRY_PAUSE * (1 << pacing.busy_rounds.min(BACKOFF_DOUBLINGS));
+        pacing.busy_rounds += 1;
+        tokio::time::sleep(pause).await;
+    }
     /// Reacts to a `NotHosted`: the shard is somewhere else, and the answer
     /// says where. Returns the node to try next, if any.
     fn redirect(&mut self, key: &[u8], not_hosted: NotHosted) -> Option<NodeId> {
@@ -265,7 +407,6 @@ impl Client {
         let channel = Channel::from_shared(endpoint.clone())
             .ok()?
             .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(REQUEST_TIMEOUT)
             .connect()
             .await
             .ok()?;
@@ -288,6 +429,8 @@ impl Client {
     pub async fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, ClientError> {
         let mut last = None;
         let mut hinted: Option<NodeId> = None;
+        let mut pacing = Pacing::default();
+        let deadline = self.request_timeout;
 
         for _ in 0..RETRY_ROUNDS {
             if self.placement.is_none() {
@@ -298,11 +441,13 @@ impl Client {
                 _ => self.candidates(key),
             };
 
+            let mut busy = false;
             for id in order {
                 let Some(channel) = self.channel(id).await else { continue };
-                match KvServiceClient::new(channel).get(GetRequest { key: key.to_vec() }).await {
+                let mut node = KvServiceClient::new(channel);
+                let call = node.get(GetRequest { key: key.to_vec() });
+                match attempt(deadline, call).await {
                     Ok(resp) => {
-                        let resp = resp.into_inner();
                         // Checked before `not_leader`: a node that does not
                         // hold the shard has no opinion about who leads it.
                         if let Some(not_hosted) = resp.not_hosted {
@@ -325,13 +470,20 @@ impl Client {
                             }
                         }
                     }
-                    Err(status) => {
-                        last = Some(status.to_string());
-                        self.forget(id);
+                    Err(refusal) => {
+                        last = Some(refusal.message().to_string());
+                        // Only a connection we cannot use is worth throwing
+                        // away. A busy node keeps its channel and its place in
+                        // the leader cache; the backoff in `pace` is what
+                        // makes the next attempt cheaper for it, not a redial.
+                        match refusal {
+                            Refusal::Busy(_) => busy = true,
+                            Refusal::Gone(_) => self.forget(id),
+                        }
                     }
                 }
             }
-            tokio::time::sleep(RETRY_PAUSE).await;
+            self.pace(hinted, busy, &mut pacing).await;
         }
         Err(ClientError::NoReachableNode { last })
     }
@@ -384,6 +536,8 @@ impl Client {
         // exists to prevent.
         self.sequence += 1;
         let ctx = Some(ClientContext { client_id: self.client_id, sequence_number: self.sequence });
+        let mut pacing = Pacing::default();
+        let deadline = self.request_timeout;
 
         for _ in 0..RETRY_ROUNDS {
             if self.placement.is_none() {
@@ -395,36 +549,32 @@ impl Client {
                 _ => self.candidates(&key),
             };
 
+            let mut busy = false;
             for id in order {
                 let Some(channel) = self.channel(id).await else { continue };
                 let mut client = KvServiceClient::new(channel);
 
                 let outcome = match &op {
-                    Write::Put { key, value } => client
-                        .put(PutRequest { ctx, key: key.clone(), value: value.clone() })
-                        .await
-                        .map(|r| {
-                            let r = r.into_inner();
-                            (r.not_hosted, r.not_leader, true)
-                        }),
-                    Write::Delete { key } => {
-                        client.delete(DeleteRequest { ctx, key: key.clone() }).await.map(|r| {
-                            let r = r.into_inner();
-                            (r.not_hosted, r.not_leader, true)
-                        })
+                    Write::Put { key, value } => {
+                        let call =
+                            client.put(PutRequest { ctx, key: key.clone(), value: value.clone() });
+                        attempt(deadline, call).await.map(|r| (r.not_hosted, r.not_leader, true))
                     }
-                    Write::Cas { key, expected, new_value } => client
-                        .cas(CasRequest {
+                    Write::Delete { key } => {
+                        let call = client.delete(DeleteRequest { ctx, key: key.clone() });
+                        attempt(deadline, call).await.map(|r| (r.not_hosted, r.not_leader, true))
+                    }
+                    Write::Cas { key, expected, new_value } => {
+                        let call = client.cas(CasRequest {
                             ctx,
                             key: key.clone(),
                             expected: expected.clone(),
                             new_value: new_value.clone(),
-                        })
-                        .await
-                        .map(|r| {
-                            let r = r.into_inner();
-                            (r.not_hosted, r.not_leader, r.swapped)
-                        }),
+                        });
+                        attempt(deadline, call)
+                            .await
+                            .map(|r| (r.not_hosted, r.not_leader, r.swapped))
+                    }
                 };
 
                 match outcome {
@@ -451,13 +601,19 @@ impl Client {
                             break;
                         }
                     }
-                    Err(status) => {
-                        last = Some(status.to_string());
-                        self.forget(id);
+                    Err(refusal) => {
+                        last = Some(refusal.message().to_string());
+                        // See the same arm in `get`: a shed write means the
+                        // driver is behind, not that the node is gone, and a
+                        // write is the expensive half to re-search for.
+                        match refusal {
+                            Refusal::Busy(_) => busy = true,
+                            Refusal::Gone(_) => self.forget(id),
+                        }
                     }
                 }
             }
-            tokio::time::sleep(RETRY_PAUSE).await;
+            self.pace(hinted, busy, &mut pacing).await;
         }
         Err(ClientError::NoReachableNode { last })
     }
