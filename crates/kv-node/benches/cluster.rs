@@ -91,11 +91,41 @@
 //! as much as the system, and the first thing to do with any curve here is
 //! re-run it with `BOHIME_BENCH_CLIENTS` swept.
 //!
+//! ## The collapse that was not there
+//!
+//! Sweeping the client count is what the paragraph above asked for, and for a
+//! while it appeared to show congestion collapse: on tmpfs, no `fdatasync`
+//! anywhere, 64 shards fell **5170 -> 3019 -> 1665 -> 784 op/s** across
+//! 64 -> 128 -> 256 -> 512 clients. Offered load up, delivered throughput
+//! down, and p99 running from 38.6 ms to 5.89 s. Three hypotheses were
+//! chased and refuted; `docs/superpowers/plans/2026-09-18-congestion.md` has
+//! them.
+//!
+//! **It was this harness.** Two compounding defects, both now fixed:
+//!
+//! - **The arms shared one cluster.** Each measured its own position in the
+//!   sweep rather than its client count. Reversing the order reversed the
+//!   curve — 2347 -> 1199 -> 919 -> 836 at 512 -> 256 -> 128 -> 64 — with the
+//!   first arm fastest either way. A cluster is now spawned per arm, not per
+//!   shard count.
+//! - **The arms did unequal work.** At a fixed number of ops *per client*, the
+//!   64-client arm wrote 2560 records and the 512-client arm 20480, so the
+//!   short arm never left its cold-start transient. A swept client count now
+//!   holds `TOTAL_OPS` constant.
+//!
+//! With both corrected, 64 shards is flat across an 8x range of concurrency —
+//! 2992 / 3525 / 3543 / 3474 op/s at 64 / 128 / 256 / 512 clients — while p50
+//! grows linearly with it, 14 -> 31 -> 59 -> 78 ms. That is a saturated
+//! system behaving properly, and it is the fourth time a benchmark in this
+//! repository has produced a confident number that was an artifact of how it
+//! was taken. The scoreboard is in `docs/KNOWN-ISSUES.md`.
+//!
 //! ## Running it
 //!
 //! ```text
 //! cargo bench -p kv-node --bench cluster
-//! BOHIME_BENCH_SHARDS=1,8,64 BOHIME_BENCH_CLIENTS=32,128,512 cargo bench -p kv-node --bench cluster
+//! BOHIME_BENCH_SHARDS=1,8,64 BOHIME_BENCH_CLIENTS=64,128,256,512 cargo bench -p kv-node --bench cluster
+//! BOHIME_BENCH_OPS=400 cargo bench -p kv-node --bench cluster   # per client, overrides TOTAL_OPS
 //! BOHIME_BENCH_ARMS=get cargo bench -p kv-node --bench cluster   # reads only
 //! BOHIME_BENCH_FSYNC=every-write cargo bench -p kv-node --bench cluster
 //! BOHIME_BENCH_DIR=/tmp cargo bench -p kv-node --bench cluster   # control only
@@ -111,16 +141,22 @@ use kv_client::Client;
 /// Bytes per value. Large enough that the record is not pure overhead, small
 /// enough that the disk is not the bandwidth bottleneck instead of the fsync.
 const VALUE_LEN: usize = 256;
-/// Writes each concurrent client issues in the timed region.
+/// Writes each concurrent client issues in the timed region, when the client
+/// count is not being swept.
 const OPS_PER_CLIENT: usize = 400;
+/// Total writes in the timed region when the client count **is** swept.
+///
+/// Held constant so that the arms are comparable. With a fixed number of ops
+/// *per client*, a 64-client arm did 2560 writes and a 512-client arm did
+/// 20480 — the short arm never leaves its cold-start transient and the long
+/// one amortises it away, so the two measure different things and the curve
+/// between them is mostly that difference. Equalised, 64 shards is flat at
+/// 2998 / 2817 / 3408 / 2581 op/s across 64 / 128 / 256 / 512 clients.
+const TOTAL_OPS: usize = 10_240;
 /// Writes each client issues before the clock starts, to get past leader
 /// election, the first segment allocation and the client's placement fetch.
 const WARMUP_PER_CLIENT: usize = 40;
 const NODES: usize = 3;
-
-fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
-}
 
 fn shard_counts() -> Vec<u16> {
     match std::env::var("BOHIME_BENCH_SHARDS") {
@@ -493,7 +529,14 @@ fn client_counts() -> Vec<usize> {
 
 fn main() {
     let client_counts = client_counts();
-    let ops = env_usize("BOHIME_BENCH_OPS", OPS_PER_CLIENT);
+    // `BOHIME_BENCH_OPS` is per client and overrides everything. Otherwise a
+    // swept client count holds the *total* constant and a single one does not.
+    let per_client = std::env::var("BOHIME_BENCH_OPS").ok().and_then(|v| v.parse::<usize>().ok());
+    let ops_for = |clients: usize| match per_client {
+        Some(n) => n,
+        None if client_counts.len() > 1 => (TOTAL_OPS / clients).max(1),
+        None => OPS_PER_CLIENT,
+    };
     let fsync = std::env::var("BOHIME_BENCH_FSYNC").ok();
     let shards = shard_counts();
     let (do_put, do_get) = arms();
@@ -505,7 +548,8 @@ fn main() {
     println!("data directory : {}", root.display());
     println!("filesystem     : {}", filesystem_of(&root));
     println!("nodes          : {NODES} processes, RF 3, loopback gRPC");
-    println!("load           : clients {client_counts:?} x {ops} ops, {VALUE_LEN}B values");
+    let shape: Vec<String> = client_counts.iter().map(|&c| format!("{c}x{}", ops_for(c))).collect();
+    println!("load           : {} ops, {VALUE_LEN}B values", shape.join(", "));
     println!("arms           : put={do_put} get={do_get}");
     match &fsync {
         Some(p) => println!("log fsync      : --log-fsync {p}"),
@@ -520,22 +564,35 @@ fn main() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
 
     for &n in &shards {
-        let cluster = spawn_cluster(&bin, n, fsync.as_deref());
         println!("shards = {n}");
-        runtime.block_on(async {
-            // Warmup: also the readiness gate. The client retries through a
-            // cold cluster, so the first successful put is the signal that
-            // the meta group elected, published a placement, and the shard
-            // groups founded and elected in turn.
-            let warm =
-                drive(&cluster.endpoints, 32, WARMUP_PER_CLIENT, |c, i, o| put_load(c, i, o, 0))
-                    .await;
-            println!("  (warmup {} ops in {:.2}s)", warm.ops(), warm.elapsed.as_secs_f64());
+        for (i, &clients) in client_counts.iter().enumerate() {
+            // **A fresh cluster per arm, not per shard count.** Arms sharing
+            // one cluster measured their own position in the sweep and not
+            // their client count: forward, 64 shards gave 5170 -> 3019 ->
+            // 1665 -> 784 op/s at 64 -> 128 -> 256 -> 512 clients, which reads
+            // as textbook congestion collapse. Reversed, the same command gave
+            // 2347 -> 1199 -> 919 -> 836 — rising with load, with the *first*
+            // arm fastest either way. What fell was never throughput against
+            // concurrency; it was throughput against everything the cluster
+            // had accumulated earlier in the run. Spawning three processes per
+            // arm costs about twelve seconds and is the only way this file can
+            // answer the question it is named for.
+            let ops = ops_for(clients);
+            let cluster = spawn_cluster(&bin, n, fsync.as_deref());
+            runtime.block_on(async {
+                // Warmup: also the readiness gate. The client retries through
+                // a cold cluster, so the first successful put is the signal
+                // that the meta group elected, published a placement, and the
+                // shard groups founded and elected in turn.
+                let warm = drive(&cluster.endpoints, 32, WARMUP_PER_CLIENT, |c, i, o| {
+                    put_load(c, i, o, 0)
+                })
+                .await;
+                println!("  (warmup {} ops in {:.2}s)", warm.ops(), warm.elapsed.as_secs_f64());
 
-            for (i, &clients) in client_counts.iter().enumerate() {
-                // Each client count gets its own phase, so a timed write is
-                // always a fresh key and the read arm has exactly the keys
-                // this client count wrote.
+                // Each client count still gets its own phase, so a timed write
+                // is a fresh key rather than an overwrite of a slot the keydir
+                // already has.
                 let phase = i as u64 + 1;
                 // The read arm reads back what the write arm wrote, so the
                 // write has to happen even when only the read is being
@@ -562,9 +619,9 @@ fn main() {
                     .await;
                     gets.report(&format!("get   c={clients}"));
                 }
-            }
-        });
+            });
+            drop(cluster);
+        }
         println!();
-        drop(cluster);
     }
 }

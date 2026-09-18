@@ -1,12 +1,46 @@
-# The write-path collapse is real, disk-independent, and not yet explained (2026-09-18)
+# The write-path collapse was the benchmark (2026-09-18)
 
 Not a milestone. `docs/KNOWN-ISSUES.md` §1 claimed the collapse was the client
-treating `ResourceExhausted` as a dead node. **That diagnosis was wrong**, and
-so were the two that replaced it. What follows is what the measurements
-actually support, what they rule out, and the two amplifiers that were real
-and are now fixed.
+treating `ResourceExhausted` as a dead node. That diagnosis was wrong, and so
+were the two that replaced it, and in the end **so was the premise**: there is
+no congestion collapse. `benches/cluster.rs` was measuring itself.
 
-## The headline
+## The resolution, which came last
+
+The four hypotheses were chased in this order, and only the fourth survived:
+shedding, the client's deadline, server-side expiry — then the harness.
+
+**The arms shared one cluster.** `spawn_cluster` ran once per shard count, and
+every client-count arm inside it wrote to the cluster the previous arms had
+already filled. So each arm measured its own *position in the sweep*, not its
+client count. Reversing the order reverses the curve:
+
+| clients | forward sweep | reverse sweep | fresh cluster per arm |
+|---|---|---|---|
+| 64  | **5170** | 836  | 2992 |
+| 128 | 3019     | 919  | 3525 |
+| 256 | 1665     | 1199 | 3543 |
+| 512 | **784**  | 2347 | 3474 |
+
+The first arm is fastest either way, whichever client count it holds. Run
+entirely alone, the 512-client arm gives 1739-2392 op/s against the 784 it
+reported as the last arm of a sweep.
+
+**And the arms did unequal work.** `BOHIME_BENCH_OPS` is ops *per client*, so
+the 64-client arm wrote 2560 records and the 512-client arm 20480 — 0.51 s
+against 8.56 s. The short arm never leaves its cold-start transient and the
+long one amortises it away. A swept client count now holds `TOTAL_OPS`
+constant.
+
+With both fixed, 64 shards is **flat across an 8x range of concurrency** —
+2992 / 3525 / 3543 / 3474 op/s — while p50 grows linearly with it, 14 -> 31 ->
+59 -> 78 ms. Throughput plateaus, latency grows with the queue: a saturated
+system behaving exactly as it should.
+
+That is the fourth benchmark in this repository to publish a confident number
+that was an artifact of how it was taken.
+
+## What the collapse looked like before that
 
 At 64 shards on **tmpfs — no `fdatasync` anywhere** — write throughput falls
 by roughly half for every doubling of the client count, from 64 clients up:
@@ -28,8 +62,8 @@ is not (38.6 ms → 5.89 s). So the lost throughput is a **starved tail**, not
 uniform slowdown: most requests are served at close to the expected rate and a
 minority wait tens of seconds.
 
-**The cause of that tail is not identified.** Three hypotheses were tested and
-all three are refuted below. That is the state of it.
+None of it was real. The tail was later arms of a sweep running against a
+cluster the earlier arms had loaded up.
 
 ## What was ruled out, and how
 
@@ -121,33 +155,25 @@ when it has not moved for a whole `request_timeout`; otherwise leave the
 request pending. Expiring it does not withdraw the entry already proposed — it
 only asks the client for a second copy of it.
 
-## Where to look next
+## What is still open
 
-The tail is the thing. p50 tracks the offered load almost exactly while p99
-runs away, so the question is not "what is slow" but **"what starves"**.
+**Why a loaded cluster is slower than a fresh one.** The artifact is gone from
+the client curve, but the effect underneath it is real and unexplained: the
+same cluster serves later arms markedly worse than earlier ones. Candidates,
+untested — the Raft logs and keydirs growing, `take_snapshot` scanning a
+larger state machine on the shared driver loop (the reason `main` puts the
+meta group on its own driver in the first place), and the session table
+accumulating a `client_id` per `Client` the harness ever built. A benchmark
+that ran a cluster for an hour would care; none of the numbers here do, now
+that every arm starts fresh.
 
-Rule out the load generator first. This benchmark has produced confidently
-wrong numbers three times (see KNOWN-ISSUES §7), and `drive()` spawns one
-tokio task per client in a single runtime, alongside three `kv-node` processes
-with 64 groups each on the same box. Latency is measured client-side, so a
-client task that is not scheduled is indistinguishable from a server that did
-not answer. **512 clients against 512 separate processes, or a second box, is
-the experiment.**
+**Whether the shard curve has the same defect.** It should not —
+`spawn_cluster` was always per shard count — but no one has checked whether
+the *order* of shard counts matters, and that is one reversed run away.
 
-If it survives that, the candidates inside the system, in order:
-
-1. **`Group::pending` is unbounded** and `Driver`'s `select!` picks randomly
-   among ready arms. A group whose request arm keeps losing keeps losing.
-2. **`peer_queue_depth` is `64 + 2 * num_shards`** — sized for one message per
-   group, not for a backlog. A sender that sheds sheds somebody's every drain,
-   and M11 already found once that the loser keeps losing.
-3. **AppendEntries is stop-and-wait per peer** (roadmap M12.5). Under a deep
-   backlog the leader's window is one batch, so a slow peer bounds every group
-   it replicates.
-
-`BOHIME_BENCH_DIR=/tmp` reproduces the whole curve in about 30 seconds, which
-is the single most useful thing this session produced: the disk was hiding a
-20-minute iteration loop behind a 3-minute one.
+`BOHIME_BENCH_DIR=/tmp` reproduces any of this in about 30 seconds, which
+remains the single most useful thing this session produced: the disk was
+hiding a 20-minute iteration loop behind a 3-minute one.
 
 ## Verification
 

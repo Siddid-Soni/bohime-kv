@@ -13,41 +13,39 @@ Last reviewed: 2026-09-18, at `e6a0c74` plus the uncommitted tick-loop work.
 
 ---
 
-## 1. Write-path congestion collapse — cause unknown
+## 1. `benches/cluster.rs` measured itself (fixed, kept as a warning)
 
-**Open, and three hypotheses deep.** Full account in
-`docs/superpowers/plans/2026-09-18-congestion.md`.
+**Resolved 2026-09-18.** Full account in
+`docs/superpowers/plans/2026-09-18-congestion.md`. Left here because it is the
+fourth time a benchmark in this repository has published a confident number
+that was an artifact of how it was taken, and because two sessions of work
+were spent on the thing it appeared to show.
 
-On tmpfs, with no `fdatasync` anywhere, write throughput falls by about half
-for every doubling of the client count above 64. At 64 shards: **5170 → 3019 →
-1665 → 784 op/s** at 64 → 128 → 256 → 512 clients. p50 stays well behaved
-(10.8 → 70.6 ms) while p99 runs from 38.6 ms to 5.89 s, so what is lost is a
-**starved tail**, not uniform slowdown.
+The apparent finding was congestion collapse: on tmpfs, with no `fdatasync`
+anywhere, 64 shards fell **5170 → 3019 → 1665 → 784 op/s** across 64 → 128 →
+256 → 512 clients. Offered load up, delivered throughput down, p99 from 38.6 ms
+to 5.89 s. Three hypotheses were chased and refuted by measurement — shedding
+(`shed = 0` throughout), the client's 2 s deadline (raised to 15 s, no change),
+and server-side expiry manufacturing duplicate proposals (real, fixed, worth
+nothing).
 
-This entry previously blamed the client's handling of `ResourceExhausted`.
-That was wrong, and so were the two hypotheses after it. Ruled out by
-measurement:
+It was the harness, twice over:
 
-- **Shedding.** A client-side counter shows `shed = 0` at 32, 128 and 256
-  clients. The 256-deep request channel never fills, because the driver drains
-  it straight into `Group::pending`, which is unbounded — so the bound is a
-  buffer in front of an unbounded queue and is not admission control at all.
-- **The client's 2 s deadline.** Raised to 15 s: 79 op/s vs 77, p99 24.9 s vs
-  28.3 s. No change.
-- **Expiry manufacturing duplicate proposals.** Real, fixed, and worth nothing
-  in throughput (1561/726/355/227 → 1533/686/321/226 at 8 shards, inside this
-  box's spread).
+- **The arms shared one cluster.** Each measured its position in the sweep,
+  not its client count. Reversed, the curve reverses: 2347 → 1199 → 919 → 836
+  at 512 → 256 → 128 → 64, first arm fastest either way.
+- **The arms did unequal work.** Ops were *per client*, so the 64-client arm
+  wrote 2560 records in 0.51 s and the 512-client arm 20480 in 8.56 s.
 
-Two genuine amplifiers were found and fixed along the way — the client no
-longer redials a node that was merely slow or busy, and a leader that is still
-committing no longer tells clients it is not the leader. Both are pinned by
-tests. **Neither moves the curve.**
+Both fixed — a cluster per arm, and `TOTAL_OPS` held constant when the client
+count is swept. 64 shards is now flat across an 8× range of concurrency
+(2992 / 3525 / 3543 / 3474 op/s) with p50 growing linearly (14 → 31 → 59 →
+78 ms), which is a saturated system behaving properly.
 
-Next step is in the plan doc, and it starts with ruling out the load generator
-itself: `drive()` spawns one tokio task per client in a single runtime beside
-three `kv-node` processes on one box, latency is measured client-side, and
-this benchmark has published wrong numbers three times before (§7).
-`BOHIME_BENCH_DIR=/tmp` reproduces the whole curve in ~30 s.
+**What is still open:** a loaded cluster really is slower than a fresh one —
+that part was not an artifact, it was just not what the axis said. Nothing
+measures it today because every arm now starts fresh. Candidates are in the
+plan doc.
 
 ## 2. `benches/engine.rs` does not measure fsync
 
@@ -144,6 +142,13 @@ is why this is a note here rather than an edit there.
   writes/s across 3 nodes is already 684. Conclusions about write *scaling*
   need `BOHIME_BENCH_DIR=/tmp` as a control arm, and that arm is not
   measuring durability.
+- **Four benchmark defects so far, three of them found in one week.**
+  `benches/engine.rs` cannot measure fsync at all (§2); the M11.5 left-right
+  arm timed 200k misses; `benches/cluster.rs`'s read arm ran at a 100% miss
+  rate for its whole existence; and its client sweep measured arm ordering
+  (§1). The pattern is not carelessness about code — it is that a benchmark
+  has no failing state, so nothing tells you it is wrong. Every number in this
+  repository should be read with "what is the control arm?" in hand.
 - **Every `get` number published before 2026-09-18 was a 100% miss rate.**
   `benches/cluster.rs` seeded both arms from one RNG, but the write arm drew a
   256-byte value before each key and the read arm did not — strides of 33 and
