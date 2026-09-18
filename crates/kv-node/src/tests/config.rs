@@ -18,6 +18,8 @@ fn cfg(id: u64) -> NodeConfig {
         num_shards: 256,
         replication_factor: 3,
         vnodes_per_node: kv_ring::DEFAULT_VNODES,
+        log_fsync: crate::config::LogFsync::default().into(),
+        state_fsync: crate::config::LogFsync::default().into(),
     }
 }
 
@@ -70,6 +72,8 @@ fn args(id: u64, peers: Vec<(u64, String)>) -> crate::config::Args {
         num_shards: 256,
         replication_factor: 1,
         vnodes_per_node: kv_ring::DEFAULT_VNODES,
+        log_fsync: Default::default(),
+        state_fsync: Default::default(),
     }
 }
 

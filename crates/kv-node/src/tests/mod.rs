@@ -7,6 +7,7 @@ mod convert;
 mod driver;
 mod end_to_end;
 mod group;
+mod group_commit;
 mod linearizability;
 mod map_read;
 mod membership;

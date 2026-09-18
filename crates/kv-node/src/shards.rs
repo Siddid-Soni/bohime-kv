@@ -232,7 +232,7 @@ fn open(
         // ourselves filtered out the way `--peer` is.
         raft.peers = voters.iter().copied().filter(|id| *id != config.id).collect();
     }
-    let node = RaftNode::new(raft, BitcaskStorage::open(&raft_dir)?);
+    let node = RaftNode::new(raft, BitcaskStorage::open_with_policy(&raft_dir, config.log_fsync)?);
     let engine = Engine::open_with_config(&state_dir, config.engine_config())?;
     Ok(Group::new(config, group, node, engine))
 }

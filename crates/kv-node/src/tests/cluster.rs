@@ -405,6 +405,8 @@ impl Cluster {
             num_shards: self.num_shards,
             replication_factor: self.replication_factor,
             vnodes_per_node: kv_ring::DEFAULT_VNODES,
+            log_fsync: crate::config::LogFsync::default().into(),
+            state_fsync: crate::config::LogFsync::default().into(),
         };
 
         // Two drivers, exactly as `main` runs them: the meta group alone in

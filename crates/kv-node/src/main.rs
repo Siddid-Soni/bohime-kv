@@ -122,7 +122,10 @@ fn open_group(
 ) -> anyhow::Result<Group> {
     std::fs::create_dir_all(raft_dir)?;
     std::fs::create_dir_all(state_dir)?;
-    let node = RaftNode::new(config.raft_config_for(group), BitcaskStorage::open(raft_dir)?);
+    let node = RaftNode::new(
+        config.raft_config_for(group),
+        BitcaskStorage::open_with_policy(raft_dir, config.log_fsync)?,
+    );
     let engine = Engine::open_with_config(state_dir, config.engine_config())?;
     Ok(Group::new(config, group, node, engine))
 }

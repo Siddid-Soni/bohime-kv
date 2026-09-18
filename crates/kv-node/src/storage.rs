@@ -18,7 +18,7 @@ use std::path::PathBuf;
 
 use kv_raft::storage::RaftStorage;
 use kv_raft::types::{Entry, HardState, LogIndex, Snapshot, Term};
-use kv_storage::Engine;
+use kv_storage::{Engine, EngineConfig, FsyncPolicy};
 use serde::{Deserialize, Serialize};
 
 const HARD_STATE_KEY: &[u8] = b"\x00hard_state";
@@ -67,12 +67,41 @@ pub struct BitcaskStorage {
     last_index: LogIndex,
     base: LogIndex,
     snapshot: Option<Snapshot>,
+    /// Publishes [`Engine::sync_count`] on every explicit [`Self::sync`], so a
+    /// test holding nothing but this `Arc` can tell whether the log had been
+    /// fsynced at the instant some *other* component did something — which is
+    /// how `tests::group_commit` pins disk-before-network without reaching
+    /// inside the driver.
+    #[cfg(test)]
+    syncs: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl BitcaskStorage {
-    pub fn open(dir: impl AsRef<Path>) -> Result<Self, BitcaskStorageError> {
+    /// Opens a log under the engine's default durability, one fsync per write.
+    ///
+    /// `cfg(test)` since the node started choosing its log's policy: every
+    /// real call site goes through [`Self::open_with_policy`] with what
+    /// `--log-fsync` asked for, and a shorthand that silently means
+    /// `EveryWrite` is how a group-commit build ends up with a
+    /// fsync-per-entry log on one path.
+    #[cfg(test)]
+    pub(crate) fn open(dir: impl AsRef<Path>) -> Result<Self, BitcaskStorageError> {
+        Self::open_with_policy(dir, EngineConfig::default().fsync_policy)
+    }
+
+    /// Opens a log under an explicit fsync policy.
+    ///
+    /// `FsyncPolicy::GroupCommit` is what makes N appends cost one fsync
+    /// instead of N+1, and it is safe **only** because `Group::drain` calls
+    /// [`Self::sync`] before it puts anything on the wire. See the module
+    /// header on `sync` and `tests::group_commit`.
+    pub fn open_with_policy(
+        dir: impl AsRef<Path>,
+        fsync_policy: FsyncPolicy,
+    ) -> Result<Self, BitcaskStorageError> {
         let path = dir.as_ref().to_path_buf();
-        let engine = Engine::open(&path)?;
+        let engine =
+            Engine::open_with_config(&path, EngineConfig { fsync_policy, ..Default::default() })?;
         let (last_index, base) = match engine.get(LOG_META_KEY)? {
             Some(bytes) => {
                 let meta: LogMeta = bincode::deserialize(&bytes)?;
@@ -92,7 +121,21 @@ impl BitcaskStorage {
                 .max(snapshot.as_ref().map(|s| s.last_included_index).unwrap_or(0)),
             base,
             snapshot,
+            #[cfg(test)]
+            syncs: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
+    }
+
+    /// How many times the log has actually been flushed to stable storage.
+    #[cfg(test)]
+    pub(crate) fn sync_count(&self) -> u64 {
+        self.engine.borrow().sync_count()
+    }
+
+    /// A handle on that count, updated by [`Self::sync`]. See the field.
+    #[cfg(test)]
+    pub(crate) fn sync_ticker(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        std::sync::Arc::clone(&self.syncs)
     }
 
     #[cfg(test)]
@@ -106,13 +149,17 @@ impl BitcaskStorage {
     /// a crash lets the node vote twice in one term and election safety is
     /// gone.
     ///
-    /// Redundant under the default `FsyncPolicy::EveryWrite`, where each write
-    /// has already synced on the way in, and a no-op when nothing is pending.
-    /// It is here so the ordering is explicit in the driver rather than an
-    /// accident of the policy: switching to `GroupCommit` for throughput must
-    /// not silently drop the guarantee.
+    /// Under `FsyncPolicy::EveryWrite` this is redundant — each write has
+    /// already synced on the way in. Under `FsyncPolicy::GroupCommit`, which
+    /// is now the node's default for the log, **it is the only thing that
+    /// makes anything durable**, and the ordering it sits in is the entire
+    /// safety argument rather than a nicety. A no-op when nothing is pending,
+    /// which is what lets the driver call it unconditionally.
     pub fn sync(&self) -> Result<(), BitcaskStorageError> {
-        self.engine.borrow_mut().sync()?;
+        let mut engine = self.engine.borrow_mut();
+        engine.sync()?;
+        #[cfg(test)]
+        self.syncs.store(engine.sync_count(), std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 

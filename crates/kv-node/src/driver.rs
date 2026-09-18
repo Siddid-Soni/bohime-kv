@@ -1123,6 +1123,18 @@ impl Group {
             .storage()
             .term(self.applied_index)?
             .expect("an applied index always has a term");
+        // The state machine has to be on the disk **before** the log prefix
+        // that could rebuild it is dropped.
+        //
+        // `Group::new` starts replay at the stored snapshot's index, on the
+        // assumption stated there that the state on disk already reflects it.
+        // Under the state machine's own fsync policy that assumption is not
+        // free: `--state-fsync group-commit` leaves applied writes in the page
+        // cache, and `take_snapshot` below truncates exactly the entries that
+        // would have replayed them. One fsync per snapshot is what buys back
+        // the two per applied write, and it is the only one the state machine
+        // needs.
+        self.engine.sync()?;
         let pairs = self.engine.scan()?;
         let data = crate::snapshot::encode(self.applied_index, term, &pairs);
         let snap = Snapshot {
@@ -1192,9 +1204,19 @@ impl Group {
         // 1. Disk. `RaftNode` already wrote through to storage inside
         //    `step`/`propose`; this is what makes it durable, and it must
         //    happen before anything leaves this process.
-        if !ready.entries.is_empty() || ready.hard_state.is_some() {
-            self.node.storage().sync()?;
-        }
+        //
+        //    Unconditional since group commit became the log's default. It
+        //    used to be guarded on this `Ready` having entries or a hard
+        //    state, which was a free optimisation under `EveryWrite` — every
+        //    write had already synced on the way in, so the guard could not
+        //    skip anything that mattered. Under `GroupCommit` the guard would
+        //    be a correctness question instead: `truncate_suffix`,
+        //    `truncate_prefix` and `save_snapshot` all dirty the log without
+        //    putting anything in `ready.entries`, and deciding which of them
+        //    can be left unsynced is exactly the kind of case analysis that
+        //    breaks silently. `Engine::sync` is a no-op when nothing is
+        //    pending, so asking every time costs a branch.
+        self.node.storage().sync()?;
 
         // 2. The inbound RPC's reply, which is a send like any other and so
         //    comes after the sync. Inbound is only ever RequestVote or

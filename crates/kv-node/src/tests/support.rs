@@ -47,6 +47,8 @@ pub(crate) fn config_in(dir: &std::path::Path) -> crate::config::NodeConfig {
         num_shards: 256,
         replication_factor: 1,
         vnodes_per_node: kv_ring::DEFAULT_VNODES,
+        log_fsync: crate::config::LogFsync::default().into(),
+        state_fsync: crate::config::LogFsync::default().into(),
     };
     // The meta group's two only. A shard's directories are created when the
     // shard is founded, and the legacy pair must stay absent — their presence

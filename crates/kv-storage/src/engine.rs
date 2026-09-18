@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 // pread. Linux-only by design: the project targets Linux and CI runs it there.
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
@@ -344,7 +345,11 @@ pub struct Engine {
     index: Index,
     unsynced: usize,
     last_sync: std::time::Instant,
-    syncs: u64,
+    /// Shared rather than a plain counter so a caller can keep watching after
+    /// the engine has been handed off — `kv-node` moves its state machines
+    /// into a `Group` and still has to be able to say whether one was fsynced.
+    /// One relaxed increment next to an fsync costs nothing measurable.
+    syncs: Arc<AtomicU64>,
 }
 
 impl Engine {
@@ -441,7 +446,7 @@ impl Engine {
             index,
             unsynced: 0,
             last_sync: std::time::Instant::now(),
-            syncs: 0,
+            syncs: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -478,13 +483,24 @@ impl Engine {
         file.sync_data()?;
         self.unsynced = 0;
         self.last_sync = std::time::Instant::now();
-        self.syncs += 1;
+        self.syncs.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
-    #[cfg(test)]
-    pub(crate) fn sync_count(&self) -> u64 {
-        self.syncs
+    /// How many times this engine has actually flushed to stable storage.
+    ///
+    /// Public, and not `cfg(test)`, because it is the only honest way to say
+    /// what a durability policy costs: under `GroupCommit` the number of
+    /// writes tells you nothing about the number of fsyncs, and the whole
+    /// point of the policy is the gap between them. `kv-node` asserts on it
+    /// across the crate boundary, and a metrics endpoint would want it too.
+    pub fn sync_count(&self) -> u64 {
+        self.syncs.load(Ordering::Relaxed)
+    }
+
+    /// A handle on [`Self::sync_count`] that outlives a move of the engine.
+    pub fn sync_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.syncs)
     }
 
     /// Flushes if the configured policy says this write should be the one

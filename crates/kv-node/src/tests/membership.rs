@@ -225,6 +225,8 @@ mod the_admin_path {
             num_shards: 256,
             replication_factor: 1,
             vnodes_per_node: kv_ring::DEFAULT_VNODES,
+            log_fsync: crate::config::LogFsync::default().into(),
+            state_fsync: crate::config::LogFsync::default().into(),
             lease_reads: false,
             keydir: Default::default(),
             snapshot_threshold: threshold,

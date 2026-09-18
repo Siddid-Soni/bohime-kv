@@ -31,6 +31,8 @@ fn config(dir: &std::path::Path, peers: BTreeMap<u64, String>) -> NodeConfig {
         num_shards: 256,
         replication_factor: 3,
         vnodes_per_node: kv_ring::DEFAULT_VNODES,
+        log_fsync: crate::config::LogFsync::default().into(),
+        state_fsync: crate::config::LogFsync::default().into(),
     };
     std::fs::create_dir_all(config.shard_raft_dir(0)).unwrap();
     std::fs::create_dir_all(config.shard_state_dir(0)).unwrap();

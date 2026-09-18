@@ -8,7 +8,7 @@ use std::time::Duration;
 use clap::Parser;
 use kv_raft::NodeId;
 use kv_ring::ShardId;
-use kv_storage::{EngineConfig, IndexKind};
+use kv_storage::{EngineConfig, FsyncPolicy, IndexKind};
 
 use crate::transport::group::GroupId;
 
@@ -28,6 +28,49 @@ impl From<KeydirImpl> for IndexKind {
         match value {
             KeydirImpl::LeftRight => IndexKind::LeftRight,
             KeydirImpl::Locked => IndexKind::Locked,
+        }
+    }
+}
+
+/// `--log-fsync`'s values. A separate enum from [`FsyncPolicy`] for the same
+/// reason [`KeydirImpl`] is separate from [`IndexKind`]: the CLI's spelling is
+/// the CLI's business, and `GroupCommit`'s two parameters are not knobs an
+/// operator should have to reason about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum LogFsync {
+    /// One fsync per entry, plus one for the log metadata. What the node did
+    /// through M11.5, and ~7× more fsyncs per write than the log needs.
+    #[value(name = "every-write")]
+    EveryWrite,
+    /// One fsync per drain, however many entries the drain persisted.
+    #[default]
+    #[value(name = "group-commit")]
+    GroupCommit,
+    /// No fsync at all. **Loses acknowledged writes on a machine crash** and
+    /// exists as the benchmark's no-durability ceiling, nothing else.
+    #[value(name = "never")]
+    Never,
+}
+
+/// The batch bound under `--log-fsync group-commit`.
+///
+/// Deliberately loose. The bound that actually holds is `Group::drain`, which
+/// syncs before it sends anything, so the policy never decides whether a write
+/// is durable in time — it is a backstop against a write that somehow reaches
+/// the engine and is never drained. Tight values here would defeat the whole
+/// point by firing between drains under light load.
+const GROUP_COMMIT_MAX_RECORDS: usize = 4096;
+const GROUP_COMMIT_MAX_DELAY: Duration = Duration::from_millis(100);
+
+impl From<LogFsync> for FsyncPolicy {
+    fn from(value: LogFsync) -> Self {
+        match value {
+            LogFsync::EveryWrite => FsyncPolicy::EveryWrite,
+            LogFsync::GroupCommit => FsyncPolicy::GroupCommit {
+                max_records: GROUP_COMMIT_MAX_RECORDS,
+                max_delay: GROUP_COMMIT_MAX_DELAY,
+            },
+            LogFsync::Never => FsyncPolicy::Never,
         }
     }
 }
@@ -68,6 +111,16 @@ pub struct NodeConfig {
     pub num_shards: u16,
     pub replication_factor: u8,
     pub vnodes_per_node: u32,
+    /// How the **Raft log** reaches stable storage (see `--log-fsync`).
+    ///
+    /// Not the state machine's: a replicated state machine is durable through
+    /// the log, so its own engine's policy is a separate question with a
+    /// separate answer.
+    pub log_fsync: FsyncPolicy,
+    /// How each **state machine** reaches stable storage (see
+    /// `--state-fsync`). A different question from the log's, with a different
+    /// answer: the state machine is a cache of the log.
+    pub state_fsync: FsyncPolicy,
 }
 
 impl NodeConfig {
@@ -115,12 +168,19 @@ impl NodeConfig {
 
     /// How every state machine on this node is opened.
     ///
-    /// The keydir implementation is the only thing this carries today; the
-    /// fsync policy and segment size are still the engine's defaults, since a
-    /// Bitcask holding a *replicated* state machine is durable through the
-    /// Raft log rather than through its own fsync.
+    /// The fsync policy here used to be the engine's default, `EveryWrite`,
+    /// directly under a comment saying a replicated state machine "is durable
+    /// through the Raft log rather than through its own fsync". The comment
+    /// was right and the code disagreed with it: every applied `Put` cost two
+    /// extra fsyncs a node, its value and its session-table row, and measured
+    /// at 8 shards those were the larger half of the whole write budget —
+    /// 119 writes/s with them, 286 without.
+    ///
+    /// What makes dropping them safe is `Group::maybe_snapshot`, which fsyncs
+    /// the state machine before `take_snapshot` drops the log prefix that
+    /// would otherwise replay it. See `--state-fsync`.
     pub fn engine_config(&self) -> EngineConfig {
-        EngineConfig { index: self.keydir, ..Default::default() }
+        EngineConfig { index: self.keydir, fsync_policy: self.state_fsync, ..Default::default() }
     }
 
     /// The single data group's directories, as they were through M10.
@@ -288,6 +348,35 @@ pub struct Args {
     /// group of one.
     #[arg(long, default_value_t = false)]
     pub join: bool,
+
+    /// How the Raft log reaches stable storage.
+    ///
+    /// `group-commit` (the default) fsyncs once per drain of the Raft
+    /// `Ready`, however many entries that drain persisted. It is safe because
+    /// the drain syncs *before* it puts anything on the wire — §1.5, disk
+    /// before network — so no vote is granted and no entry counted toward a
+    /// commit until it is on the disk. `every-write` is the pre-M11.5
+    /// behaviour, one fsync per entry plus one for the log metadata, and is
+    /// kept so the two can be compared on one build. `never` is for
+    /// benchmarks: it loses acknowledged writes on a machine crash.
+    #[arg(long, value_enum, default_value_t = LogFsync::GroupCommit)]
+    pub log_fsync: LogFsync,
+
+    /// How each state machine reaches stable storage.
+    ///
+    /// Separate from `--log-fsync` because the two are not the same question.
+    /// A state machine holds nothing the Raft log does not already hold
+    /// durably, and a restart replays the log tail over it, so its own fsyncs
+    /// buy no data that would otherwise be lost — they only shorten replay.
+    /// The one place that stops being true is a snapshot, which drops the log
+    /// prefix; `Group::maybe_snapshot` fsyncs the state machine first, which
+    /// is the single fsync this policy still needs and cannot skip.
+    ///
+    /// `group-commit` is the default. `every-write` is the pre-M11.5
+    /// behaviour: two extra fsyncs per applied write per node, for a faster
+    /// restart.
+    #[arg(long, value_enum, default_value_t = LogFsync::GroupCommit)]
+    pub state_fsync: LogFsync,
 }
 
 fn parse_peer(s: &str) -> Result<(NodeId, String), String> {
@@ -345,6 +434,8 @@ impl Args {
             num_shards: self.num_shards,
             replication_factor: self.replication_factor,
             vnodes_per_node: self.vnodes_per_node,
+            log_fsync: self.log_fsync.into(),
+            state_fsync: self.state_fsync.into(),
         })
     }
 }

@@ -58,6 +58,8 @@ pub(crate) mod the_m10_gate {
             // cluster by necessity.
             replication_factor: 1,
             vnodes_per_node: kv_ring::DEFAULT_VNODES,
+            log_fsync: crate::config::LogFsync::default().into(),
+            state_fsync: crate::config::LogFsync::default().into(),
         }
     }
 
