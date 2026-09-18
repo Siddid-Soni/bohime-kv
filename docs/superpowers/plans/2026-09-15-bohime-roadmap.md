@@ -247,7 +247,7 @@ impl RaftNode {
 
 **Risks:**
 - The commit rule (M3.5) and the election restriction (M3.6) are where hand-rolled Raft implementations are usually wrong, and both failures are *silent* — the cluster works fine until a specific partition-and-recover sequence loses a committed write. This is exactly what M4 exists to find. Do not be reassured by M3's own tests passing.
-- Resist adding batching, pipelining, or pre-vote here. They are M13 and M9 concerns; adding them now doubles the state space M4 has to search before M4 exists.
+- Resist adding batching, pipelining, or pre-vote here. They are M12.5, M13 and M9 concerns; adding them now doubles the state space M4 has to search before M4 exists.
 
 ---
 
@@ -529,13 +529,67 @@ pub type SharedMap = arc_swap::ArcSwap<ShardMap>;
 
 ---
 
+## M12.5 — AppendEntries pipelining  *(~1 session)*
+
+**Added 2026-09-18, after M11.5's throughput work measured what its absence
+costs.** The plan named pipelining twice — `docs/DESIGN.md:370` calls it "a
+real throughput multiplier and worth benchmarking before/after", and M13's
+task 2 below benchmarks "with and without" it — but **no milestone ever said
+to build it**. It fell through the gap between M3's "resist adding it here"
+and M13's "measure it", so M13 was about to benchmark a feature nothing had
+implemented. This section closes that gap.
+
+**Why it is worth a milestone.** `next_index` advances only when an ack
+arrives (`crates/kv-raft/src/node.rs:877`) and `send_append` always sends from
+`next_index`, so a leader has one batch in flight per peer and its throughput
+is capped at *batch ÷ round trip*. Measured on three real processes, one
+shard, 32 closed-loop clients: 92 writes/s at p50 342 ms — and 32 ÷ 0.342 s is
+93.6, so that node was bound by round trips and nothing else. It was not
+fsync-bound: group commit had already taken the log down to one fsync per
+drain. Sharding hides this (more groups, more concurrent round trips) which is
+exactly why it went unnoticed until a per-shard-count benchmark existed.
+
+**Files:** Modify `crates/kv-raft/src/node.rs`, `crates/kv-raft/src/replication.rs`, `crates/kv-raft/src/tests/replication.rs`.
+
+**Tasks:**
+1. Track a separate "sent up to" cursor per peer, distinct from `next_index`,
+   so a second AppendEntries can go out before the first is acked. `match_index`
+   continues to come only from acks — it is what the commit rule reads, and
+   inferring it from what was *sent* is the classic way to commit an entry no
+   follower holds.
+2. Bound the in-flight window per peer, and make it configurable. Unbounded
+   pipelining against a slow follower is the unbounded queue `DESIGN.md:368`
+   already rules out; the bound is what keeps backpressure meaningful.
+3. On a rejection, reset the cursor to the backtracked `next_index` and discard
+   what was in flight — a conflict invalidates everything sent after it.
+4. Leave `Ready`'s shape alone if possible. If pipelining needs a new `Action`
+   or `Ready` field, say so explicitly: it is a change to the purity boundary's
+   contract and both `kv-node` and `kv-sim` execute it.
+
+**Gate:**
+- ✅ A leader with a healthy follower has more than one AppendEntries
+  outstanding — asserted on the core, not inferred from a timing improvement.
+- ✅ A rejection mid-pipeline backtracks correctly and the follower's log
+  converges; no entry is ever committed that a quorum does not hold.
+- ✅ **The 100k-seed nemesis sweep passes.** Non-negotiable: this changes
+  replication state in `kv-raft`, which is precisely what M4 exists to check.
+  The sweep must be green *before* this starts, so a failure afterwards is
+  attributable.
+- ✅ `benches/cluster.rs` (built during M11.5's throughput work) shows the
+  before/after at 1 shard, where the cap binds hardest.
+
+**Risk:** the failure mode is committing an entry a quorum does not hold, and
+it is silent. `match_index` must never be advanced by anything but an ack.
+
+---
+
 ## M13 — Proof, polish, and the resume artifact  *(~2-3 sessions)*
 
 **Files:** Create `crates/kv-sim/src/linearizability.rs`, `scripts/demo.sh`, `docker-compose.yml`, `benches/cluster.rs`. Modify `README.md` substantially, `crates/kv-client/src/cli.rs`.
 
 **Tasks:**
 1. Linearizability checker (Wing-Gong / P-compositionality style) over recorded histories; run it against the real cluster under the nemesis, not only against the simulator.
-2. Criterion benchmarks: throughput and latency vs. shard count, vs. fsync policy, with and without AppendEntries pipelining.
+2. Criterion benchmarks: throughput and latency vs. shard count, vs. fsync policy, with and without AppendEntries pipelining (implemented at M12.5 — this task measures it, it does not build it). A scaling benchmark must **scale offered load with shard count**: holding client count fixed while shards rise measures a fixed load divided into smaller batches, which bends the curve down for reasons that have nothing to do with the architecture.
 3. `kv-client` CLI polish; `docker-compose` or a shell script for a 5-node cluster.
 4. README: architecture diagram, the benchmark table, the left-right scaling graph from M11.5, the seeded-simulation story, and **what is explicitly not supported and why** — no cross-shard transactions, no range scans, lease reads assume bounded clock drift. The non-goals section is what makes the rest credible.
 
