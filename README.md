@@ -2,25 +2,35 @@
 
 A sharded, Raft-replicated key-value store in Rust, over gRPC.
 
-**Status: in progress (M7 of M13).** Three processes form a Raft group, a
-client writes through the leader, reads are linearizable, `kill -9` on the
-leader loses nothing, and a retried compare-and-swap applies exactly once.
+**Status: in progress (M12.1 of M13; M12.2 and M12.5 not started).** A cluster
+shards its keyspace across 256 independent Raft groups, replicated 3-way by
+default; a node can be added live and receives its share of shards by
+migration; reads are linearizable; `kill -9` on any leader loses nothing; and
+a retried compare-and-swap applies exactly once.
 
 Implemented and tested: the Bitcask storage engine (record codec, append-only
 segments, crash-safe reopen via log replay, segment rotation, compaction with
-hint files, torn-tail truncation, a crash-safe compaction commit manifest, and
-a configurable fsync policy with group commit); the Raft core as a pure state
-machine with no I/O, no async and no clock reads; a deterministic simulator
-that runs whole clusters under packet loss, partitions and crashes across
-100,000 seeds and reproduces any failure byte-for-byte from its seed; a gRPC
-transport with bounded queues, per-RPC deadlines and reconnect-with-backoff;
-ReadIndex for linearizable reads; a replicated session table for exactly-once
-retries; and the node binary and client that turn all of it into a working
-key-value store.
+hint files, torn-tail truncation, a crash-safe compaction commit manifest, a
+configurable fsync policy with group commit, and a wait-free `left-right`
+keydir alongside the original locked one); the Raft core as a pure state
+machine with no I/O, no async and no clock reads, including snapshots
+(`InstallSnapshot`, log truncation) and membership changes (learner → voter
+promotion, single-server removal); a deterministic simulator that runs whole
+clusters under packet loss, partitions and crashes across 100,000 seeds and
+reproduces any failure byte-for-byte from its seed; a gRPC transport with
+bounded per-peer queues, per-RPC deadlines, reconnect-with-backoff and
+batched multi-group messages; ReadIndex for linearizable reads (plus an
+opt-in zero-round-trip lease-read path); a replicated session table for
+exactly-once retries; consistent hashing over a versioned shard map, agreed
+by a dedicated meta Raft group; one tick loop driving every shard group a
+node replicates; and a migration driver that moves shards onto a newly
+admitted node (learner-add → catch-up → promote → remove-old, rate-limited)
+without failing in-flight requests.
 
-Ahead: snapshots (M8), membership change (M9), then the sharding work —
-consistent hashing over 256 shards with one independent Raft group each
-(M10-M12).
+Ahead: Merkle verification for rebalance correctness (M12.2), AppendEntries
+pipelining (M12.5), then M13. `docs/KNOWN-ISSUES.md` tracks what's built but
+not yet correct in every case — notably, a replica removed by a rebalance
+does not yet reclaim its shard's disk (§8).
 
 ### On reads
 
@@ -65,7 +75,29 @@ done
 ```
 
 Every node takes the same `--peer` flags; only `--id` and `--listen` differ.
-The client finds the leader from the `NotLeader` hints and caches it.
+The client finds the leader from the `NotLeader` hints and caches it. Every
+node also bootstraps the same 256-shard, RF-3 map by default (`--shards`,
+`--replication-factor`, `--vnodes` are bootstrap-only — see `CLAUDE.md`); a
+key routes to its shard's own Raft group under the hood, invisibly to the
+client above.
+
+### Adding a node, and rebalancing
+
+There is no admin CLI yet (`docs/DESIGN.md`'s "known-wrong-on-purpose" list);
+membership and rebalance calls go straight through the gRPC `AdminService`
+(`proto/admin.proto`), e.g. with `grpcurl`:
+
+```
+grpcurl -plaintext -d '{"node_id": 4, "address": "127.0.0.1:7524"}' \
+  127.0.0.1:7521 bohime.admin.AdminService/AddNode
+```
+
+A joining node still needs `--peer` for the cluster as it stands, plus
+`--join`, and is admitted as a learner before being promoted to a voter. Once
+it's a voter, each shard's leader reconciles its own group against the
+published map on its own; `Rebalance` just nudges that pass to run now rather
+than waiting for its periodic sweep, and `RebalanceResponse.diverging_shards`
+tells you whether *this node's* leadership is done, not the cluster's.
 
 This README will grow into the real project overview (architecture diagram,
 benchmark table, explicit non-goals) as milestones land — see M13.
@@ -88,20 +120,81 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 ```
 
-### Storage: fsync policy
+## Benchmarks
 
-1,000 sequential `put`s of a small value, `cargo bench -p kv-storage -- fsync_policy`.
-Measured on 12th Gen Intel i9-12900H, tmpfs (`/tmp`), Linux 7.2.3-arch1-3.
+Four benches exist, all Criterion-based. Three so far have caught the
+benchmark measuring itself rather than the system — see
+`docs/KNOWN-ISSUES.md` §7 before trusting a number that predates this
+section, and read a bench file's own doc comment before quoting its numbers
+elsewhere: that comment is the source of truth, this table is a summary of it.
 
-| policy | time / 1k writes | writes / sec | loss window on machine crash |
+### Storage micro-benchmarks (`cargo bench -p kv-storage`)
+
+- `--bench engine -- fsync_policy` — 1,000 sequential `put`s of a small value.
+- `--bench read_scaling` — `Engine::get` under 1-20 concurrent readers, plus a
+  cold-cache single-read arm.
+- `--bench index_scaling` — the keydir alone (`RwLock<HashMap>` vs. `DashMap`
+  vs. `left-right`) under concurrent reads, with and without a writer.
+
+`read_scaling` and `index_scaling` write to `CARGO_TARGET_TMPDIR` (real disk)
+on purpose; `engine`'s fsync arm below runs on tmpfs (`/tmp`), where
+`fsync`/`fdatasync` return without doing anything asked of a real disk — a
+deliberate choice for this arm because it isolates the syscall's own cost, not
+a mistake, but do not compare it against the other two benches' numbers.
+
+Measured on a 12th Gen Intel i9-12900H, 6 P-cores + 8 E-cores, Linux
+7.2.3-arch1-3:
+
+| policy (`engine`, tmpfs) | time / 1k writes | writes / sec | loss window on machine crash |
 |---|---|---|---|
 | `Never` | ~499µs | ~2.00M | everything not yet flushed by the OS |
 | `GroupCommit { max_records: 100, max_delay: 10ms }` | ~522µs | ~1.92M | ≤100 records or ≤10ms |
 | `EveryWrite` | ~664µs | ~1.51M | none |
 
-Note on what these numbers do and do not prove: the benchmark measures the
-cost of the `fsync` calls, and the loss-window column is an argument from the
-code, not a measured result. Demonstrating it would require cutting power to
-the machine — a `kill -9` proves nothing here, because the page cache
-outlives the process. (These particular numbers were taken on tmpfs, where
-`sync_data` is cheap; expect a far wider gap on a real disk.)
+The loss-window column is an argument from the code, not a measured result —
+demonstrating it would mean cutting power to the machine, since `kill -9`
+proves nothing while the page cache outlives the process.
+
+`read_scaling` (real disk, `Engine::get`, 1→20 threads): 0.90 → 6.5 Melem/s,
+**7.2×**, flat from 16 threads on — the ceiling is one shared `struct file`
+per segment inside the kernel, not the keydir, not this crate. `index_scaling`
+measures what `left-right` buys once that ceiling is removed from the
+comparison; see the file's own doc comment for the three arms' numbers, which
+move as `kv-storage` changes.
+
+### Cluster throughput (`cargo bench -p kv-node --bench cluster`)
+
+Spawns real `kv-node` processes and drives them over real gRPC with the real
+client — the only bench here that measures what a caller actually gets,
+writes/sec and latency, rather than one crate in isolation. Every run needs a
+control arm (see the bench file's own doc comment for why); the defaults run
+both a write and a read sweep across shard counts.
+
+```
+cargo bench -p kv-node --bench cluster                                    # defaults
+BOHIME_BENCH_SHARDS=1,8,64 BOHIME_BENCH_CLIENTS=64,128,256,512 \
+  cargo bench -p kv-node --bench cluster
+BOHIME_BENCH_OPS=400 cargo bench -p kv-node --bench cluster    # per client, overrides TOTAL_OPS
+BOHIME_BENCH_ARMS=get cargo bench -p kv-node --bench cluster   # reads only
+BOHIME_BENCH_FSYNC=every-write cargo bench -p kv-node --bench cluster
+BOHIME_BENCH_DIR=/tmp cargo bench -p kv-node --bench cluster   # tmpfs control only, not a result
+```
+
+Same machine, btrfs on NVMe, RF 3, 32 concurrent clients, 256-byte
+pseudo-random values, writes/sec:
+
+| shards | `EveryWrite` (before group commit) | `group-commit` (after) | tmpfs control |
+|---|---|---|---|
+| 1 | 58 | 91 | 121 |
+| 8 | 88 | 237 | 1068 |
+| 64 | 82 | 137 | 1897 |
+
+The "before" column is flat — sharding alone did not multiply write
+throughput; every shard's log landed on the same `fdatasync`-limited device.
+Group commit is the lever that moved it, not shard count. Sweeping client
+count at 64 shards instead of shard count is flat across an 8× concurrency
+range (2992-3543 op/s at 64-512 clients) with p50 growing linearly (14→78ms)
+— a saturated system, not a collapse; an earlier reading of that same sweep
+as "congestion collapse" was the harness sharing one cluster and doing
+unequal work per arm, fixed in `7a19b60`. Do not publish a number from this
+bench without its control arms alongside it.

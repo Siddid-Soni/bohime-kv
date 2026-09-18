@@ -11,7 +11,12 @@ use kv_storage::Engine;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::NodeConfig;
-use crate::driver::{ClientOp, ClientReply, ClientRequest, Driver, Group, GroupChannels};
+use kv_ring::ShardId;
+
+use crate::driver::{
+    AdminOp, AdminReply, AdminRequest, ClientOp, ClientReply, ClientRequest, Driver, Group,
+    GroupChannels,
+};
 use crate::storage::BitcaskStorage;
 use crate::tests::support::SilentPeers;
 
@@ -31,6 +36,7 @@ fn config(dir: &std::path::Path, peers: BTreeMap<u64, String>) -> NodeConfig {
         num_shards: 256,
         replication_factor: 3,
         vnodes_per_node: kv_ring::DEFAULT_VNODES,
+        max_migrations: 4,
         log_fsync: crate::config::LogFsync::default().into(),
         state_fsync: crate::config::LogFsync::default().into(),
     };
@@ -39,31 +45,72 @@ fn config(dir: &std::path::Path, peers: BTreeMap<u64, String>) -> NodeConfig {
     config
 }
 
-/// Starts a driver and returns the request channel. The inbox and peer-reply
-/// senders are returned too: dropping them would close those `select!` arms
-/// and shut the loop down mid-test.
-fn spawn(config: &NodeConfig) -> (mpsc::Sender<ClientRequest>, Box<dyn std::any::Any + Send>) {
+/// Shard 0's group, alone in its cluster so it elects itself immediately.
+fn group_zero(config: &NodeConfig) -> Group {
     let node = RaftNode::new(
         config.raft_config(),
         BitcaskStorage::open(config.shard_raft_dir(0)).unwrap(),
     );
     let engine = Engine::open(config.shard_state_dir(0)).unwrap();
+    Group::new(config, crate::transport::group::DATA, node, engine)
+}
 
+/// Starts a driver over `groups`, handing back every channel a test might
+/// need to drive it. The inbox and peer-reply senders come back in the
+/// keepalive box: dropping either would close that `select!` arm and shut the
+/// loop down mid-test.
+fn spawn_hosting(
+    config: &NodeConfig,
+    groups: Vec<Group>,
+) -> (
+    mpsc::Sender<ClientRequest>,
+    mpsc::Sender<AdminRequest>,
+    mpsc::Sender<Group>,
+    Box<dyn std::any::Any + Send>,
+) {
     let (inbox_tx, inbox) = mpsc::channel(8);
     let (replies_tx, replies) = mpsc::channel(8);
     let (requests, requests_rx) = mpsc::channel(8);
     let (admin_tx, admin) = mpsc::channel(8);
-
     let (groups_tx, new_groups) = mpsc::channel(8);
+
     let driver = Driver::new(
         config,
-        vec![Group::new(config, crate::transport::group::DATA, node, engine)],
+        groups,
         BTreeMap::new(),
         Box::new(SilentPeers),
         GroupChannels { inbox, peer_replies: replies, requests: requests_rx, admin, new_groups },
     );
     tokio::spawn(driver.run());
-    (requests, Box::new((inbox_tx, replies_tx, admin_tx, groups_tx)))
+    (requests, admin_tx, groups_tx, Box::new((inbox_tx, replies_tx)))
+}
+
+/// Starts a driver on shard 0 alone and returns the request channel.
+fn spawn(config: &NodeConfig) -> (mpsc::Sender<ClientRequest>, Box<dyn std::any::Any + Send>) {
+    let (requests, admin_tx, groups_tx, keepalive) =
+        spawn_hosting(config, vec![group_zero(config)]);
+    (requests, Box::new((admin_tx, groups_tx, keepalive)))
+}
+
+/// One admin request to the driver, naming the group.
+async fn admin(
+    tx: &mpsc::Sender<AdminRequest>,
+    group: crate::transport::group::GroupId,
+    op: AdminOp,
+) -> AdminReply {
+    let (reply, wait) = oneshot::channel();
+    tx.send(AdminRequest { group, op, reply }).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), wait)
+        .await
+        .expect("the driver answers an admin request")
+        .expect("the driver does not drop it")
+}
+
+async fn hosted_shards(tx: &mpsc::Sender<AdminRequest>) -> Vec<ShardId> {
+    match admin(tx, crate::transport::group::UNSET, AdminOp::ShardStatuses).await {
+        AdminReply::ShardStatuses(statuses) => statuses.into_iter().map(|s| s.shard).collect(),
+        other => panic!("the driver answered a status request with {other:?}"),
+    }
 }
 
 /// One request, one answer, no retry. Used where the refusal *is* the
@@ -341,4 +388,70 @@ async fn a_reserved_key_is_refused_at_the_service_boundary() {
         .put(PutRequest { ctx: None, key: binary, value: b"ok".to_vec() })
         .await
         .expect("a zero byte elsewhere in the key is not reserved");
+}
+
+/// The map alone is not enough to delete data: a group whose committed config
+/// still names this node is one this node still replicates, whatever placement
+/// has decided.
+///
+/// A node behind on its log has a stale map *and* a stale config, and they are
+/// stale for different reasons — which is exactly the situation a single
+/// witness gets wrong.
+#[tokio::test]
+async fn a_group_that_still_names_this_node_is_not_released() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config(dir.path(), BTreeMap::new());
+    let (requests, admin_tx, _groups, _keep) = spawn_hosting(&config, vec![group_zero(&config)]);
+
+    // A lone voter elects itself and commits its no-op, so the group has both
+    // a committed config and this node in it.
+    retrying(&requests, || ClientOp::put(b"k", b"v")).await;
+
+    let reply =
+        admin(&admin_tx, crate::transport::group::DATA, AdminOp::ReleaseShard { shard: 0 }).await;
+    assert!(
+        matches!(reply, AdminReply::Released { released: false }),
+        "a group that still names this node was released: {reply:?}"
+    );
+    assert_eq!(hosted_shards(&admin_tx).await, vec![0], "a refused release dropped the group");
+}
+
+/// The empty-adoption case. A shard adopted because the map placed it here,
+/// whose leader then never contacted it — the map moved again first — holds
+/// the fabricated `{voters: {}, learners: {me}}` config, which *does* name
+/// this node. Read literally, the config witness would never fire and the
+/// shard would be unreclaimable forever.
+///
+/// A group that has committed nothing also holds nothing, so releasing it
+/// loses nothing, which is what makes the exception safe rather than merely
+/// convenient.
+#[tokio::test]
+async fn an_adopted_group_that_was_never_contacted_is_reclaimed() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config(dir.path(), BTreeMap::new());
+    let (_requests, admin_tx, groups, _keep) = spawn_hosting(&config, Vec::new());
+
+    let adopted = crate::shards::open(
+        &config,
+        3,
+        crate::transport::group::shard(3),
+        crate::shards::Origin::Adopt,
+    )
+    .unwrap();
+    groups.send(adopted).await.unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while hosted_shards(&admin_tx).await != vec![3] {
+        assert!(std::time::Instant::now() < deadline, "the driver never hosted the adopted group");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let reply =
+        admin(&admin_tx, crate::transport::group::shard(3), AdminOp::ReleaseShard { shard: 3 })
+            .await;
+    assert!(
+        matches!(reply, AdminReply::Released { released: true }),
+        "an adopted group that committed nothing was not reclaimable: {reply:?}"
+    );
+    assert!(hosted_shards(&admin_tx).await.is_empty(), "a released group is still hosted");
 }

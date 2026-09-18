@@ -225,6 +225,7 @@ mod the_admin_path {
             num_shards: 256,
             replication_factor: 1,
             vnodes_per_node: kv_ring::DEFAULT_VNODES,
+            max_migrations: 4,
             log_fsync: crate::config::LogFsync::default().into(),
             state_fsync: crate::config::LogFsync::default().into(),
             lease_reads: false,
@@ -483,11 +484,23 @@ mod the_admin_path {
         // This harness is a single data-group node, so the meta channel it is
         // handed goes nowhere: these tests exercise membership, not the map.
         let (meta_requests, _meta) = tokio::sync::mpsc::channel(1);
+        let published = crate::meta::PublishedMap::default();
+        // A reconciler over the same channels, unspawned: nothing here calls
+        // `Rebalance`, and with no published map a pass is a no-op anyway.
+        let migrate_dir = tempfile::tempdir().unwrap();
+        let migrate = std::sync::Arc::new(crate::migrate::MigrationDriver::new(
+            crate::tests::support::config_in(migrate_dir.path()),
+            harness.admin.clone(),
+            harness.admin.clone(),
+            std::sync::Arc::clone(&published),
+            crate::migrate::MIGRATE_INTERVAL,
+        ));
         let service = crate::admin_service::AdminApi::new(
             harness.admin.clone(),
             meta_requests,
             harness.admin.clone(),
-            crate::meta::PublishedMap::default(),
+            published,
+            migrate,
         );
         let addr = format!("127.0.0.1:{port}").parse().unwrap();
         tokio::spawn(async move {

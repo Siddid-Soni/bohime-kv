@@ -10,6 +10,8 @@
 // boundary for no benefit; the rest of the shell carries the same allow.
 #![allow(clippy::result_large_err)]
 
+use std::sync::Arc;
+
 use kv_proto::admin as pb;
 use kv_proto::admin::admin_service_server::AdminService;
 use tokio::sync::{mpsc, oneshot};
@@ -17,6 +19,7 @@ use tonic::{Request, Response, Status};
 
 use crate::driver::{AdminOp, AdminReply, AdminRequest, ClientOp, ClientReply, ClientRequest};
 use crate::meta::PublishedMap;
+use crate::migrate::MigrationDriver;
 use crate::shard_map::SHARD_MAP_KEY;
 use crate::transport::group;
 
@@ -37,6 +40,9 @@ pub struct AdminApi {
     shard_admin: mpsc::Sender<AdminRequest>,
     /// What this node's reconciler last published. The cheap read.
     published: PublishedMap,
+    /// This node's migration reconciler, shared with the task that loops it,
+    /// so `Rebalance` runs a pass now instead of waiting one out.
+    migrate: Arc<MigrationDriver>,
 }
 
 impl AdminApi {
@@ -45,8 +51,9 @@ impl AdminApi {
         meta_requests: mpsc::Sender<ClientRequest>,
         shard_admin: mpsc::Sender<AdminRequest>,
         published: PublishedMap,
+        migrate: Arc<MigrationDriver>,
     ) -> Self {
-        Self { requests, meta_requests, shard_admin, published }
+        Self { requests, meta_requests, shard_admin, published, migrate }
     }
 
     /// What this node is carrying, shard by shard.
@@ -122,7 +129,10 @@ impl AdminService for AdminApi {
                 index: 0,
             })),
             AdminReply::Rejected { reason } => Err(rejected(reason)),
-            AdminReply::Status(_) | AdminReply::ShardMap(_) | AdminReply::ShardStatuses(_) => {
+            AdminReply::Status(_)
+            | AdminReply::ShardMap(_)
+            | AdminReply::ShardStatuses(_)
+            | AdminReply::Released { .. } => {
                 Err(Status::internal("driver answered the wrong request"))
             }
         }
@@ -142,7 +152,10 @@ impl AdminService for AdminApi {
                 index: 0,
             })),
             AdminReply::Rejected { reason } => Err(rejected(reason)),
-            AdminReply::Status(_) | AdminReply::ShardMap(_) | AdminReply::ShardStatuses(_) => {
+            AdminReply::Status(_)
+            | AdminReply::ShardMap(_)
+            | AdminReply::ShardStatuses(_)
+            | AdminReply::Released { .. } => {
                 Err(Status::internal("driver answered the wrong request"))
             }
         }
@@ -179,6 +192,7 @@ impl AdminService for AdminApi {
                     shard_id: s.shard as u32,
                     leader_id: s.leader.unwrap_or(0),
                     replicas: s.replicas,
+                    learners: s.learners,
                     term: s.term,
                     leading: s.leading,
                     applied_index: s.applied_index,
@@ -250,21 +264,28 @@ impl AdminService for AdminApi {
         }))
     }
 
-    /// M12. Rebalancing needs the ring (M10) and Merkle verification, neither
-    /// of which exists yet; answering anything but "unimplemented" would be a
-    /// lie an operator could act on.
+    /// Runs this node's migration pass now and says what is still moving.
+    ///
+    /// Deliberately per-node, and that is not a shortcut: there is no
+    /// rebalance coordinator to ask. The map is the plan and each shard's
+    /// leader carries out its own part, so "is the rebalance done" is
+    /// answered by asking every node — which is what an operator's loop over
+    /// `ClusterStatus` already does.
     async fn rebalance(
         &self,
         _request: Request<pb::RebalanceRequest>,
     ) -> Result<Response<pb::RebalanceResponse>, Status> {
-        Err(Status::unimplemented("rebalancing arrives with M12"))
+        let diverging = self.migrate.pass().await;
+        Ok(Response::new(pb::RebalanceResponse { diverging_shards: diverging as u32 }))
     }
 
-    /// M12, for the same reason as `rebalance`.
+    /// M12.2: Merkle trees over each shard's keyspace, compared across
+    /// replicas. Answering anything but "unimplemented" would be a lie an
+    /// operator could act on.
     async fn verify_shard(
         &self,
         _request: Request<pb::VerifyShardRequest>,
     ) -> Result<Response<pb::VerifyShardResponse>, Status> {
-        Err(Status::unimplemented("shard verification arrives with M12"))
+        Err(Status::unimplemented("shard verification arrives with M12.2"))
     }
 }

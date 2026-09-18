@@ -11,6 +11,7 @@ mod linearizability;
 mod map_read;
 mod membership;
 mod meta;
+mod migrate;
 mod multi_raft;
 mod placement;
 mod read_engine;

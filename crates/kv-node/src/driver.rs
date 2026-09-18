@@ -173,6 +173,18 @@ pub enum AdminOp {
     /// lead" — and answering it per group would be 154 round trips. The
     /// `group` on the request is ignored.
     ShardStatuses,
+    /// Stop hosting `shard`, if this group agrees it has left (M12.1).
+    ///
+    /// Answered node-wide by the driver rather than by the group, because the
+    /// answer is to *drop* the group and a group cannot drop itself. The check
+    /// here is one of the two witnesses a departing shard needs: the group's
+    /// own committed config no longer contains this node. The other — the
+    /// published map no longer places the shard here — belongs to the
+    /// supervisor, which is also what deletes the directories. Neither side
+    /// can delete data on its own, and that is the point of splitting them.
+    ReleaseShard {
+        shard: ShardId,
+    },
     /// This replica's locally-applied shard map, as bytes (M10.6).
     ///
     /// Deliberately **not** linearizable, and deliberately not a `Get`: it is
@@ -197,6 +209,12 @@ pub enum AdminReply {
     },
     Status(ClusterStatus),
     ShardStatuses(Vec<ShardStatus>),
+    /// Whether the group was dropped (M12.1). `false` is not an error: a
+    /// group whose config still names this node is one this node still
+    /// replicates, whatever the map has decided.
+    Released {
+        released: bool,
+    },
     /// `None` before the meta group has bootstrapped a map.
     ShardMap(Option<Vec<u8>>),
     NotLeader {
@@ -240,6 +258,10 @@ pub struct ShardStatus {
     pub leader: Option<NodeId>,
     pub term: Term,
     pub replicas: Vec<NodeId>,
+    /// Members replicating but not voting (M12.1). Separate from `replicas`
+    /// because the two answer different questions: `replicas` is who this
+    /// shard's quorum is drawn from, `learners` is who is on the way in.
+    pub learners: Vec<NodeId>,
     /// Whether *this* node leads the shard. The gate's whole question.
     pub leading: bool,
     pub applied_index: LogIndex,
@@ -507,6 +529,30 @@ impl Group {
         self.group
     }
 
+    /// This group's voters, for a test asserting on a group no driver is
+    /// running. The production comparison against the map goes through
+    /// `ShardStatus`, which reads the same config through the driver.
+    #[cfg(test)]
+    pub(crate) fn voters(&self) -> BTreeSet<NodeId> {
+        self.node.cluster_config().voters.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn learners(&self) -> BTreeSet<NodeId> {
+        self.node.cluster_config().learners.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn role(&self) -> Role {
+        self.node.role()
+    }
+
+    /// One logical tick, for a test driving a group with no driver under it.
+    #[cfg(test)]
+    pub(crate) fn tick(&mut self) {
+        self.node.tick();
+    }
+
     /// The handles a reader needs to serve this group's `Get`s from another
     /// task: a factory to mint its own view from, and how far that view is
     /// published.
@@ -720,11 +766,40 @@ impl Driver {
                     leader: group.node.leader_id(),
                     term: group.node.current_term(),
                     replicas: config.voters.iter().copied().collect(),
+                    learners: config.learners.iter().copied().collect(),
                     leading: group.node.role() == Role::Leader,
                     applied_index: group.applied_index,
                 })
             })
             .collect()
+    }
+
+    /// Drops a shard group this node has left, closing its log and its state
+    /// machine. Returns whether it did (M12.1).
+    ///
+    /// "Has left" is: the group's committed config does not contain us, **or**
+    /// the group has committed nothing at all. The second case is the shard
+    /// adopted in anticipation of a migration that then went elsewhere — its
+    /// fabricated `{voters: {}, learners: {me}}` config does name us, so
+    /// without it such a shard would never be reclaimable. A group that has
+    /// committed nothing also holds nothing, so dropping it loses nothing.
+    fn release(&mut self, shard: ShardId) -> bool {
+        let id = group::shard(shard);
+        let Some(group) = self.groups.get(&id) else {
+            // Already gone. Idempotent on purpose: the supervisor retries.
+            return true;
+        };
+        let config = group.node.cluster_config();
+        let left = !config.contains(group.node.id()) || group.node.commit_index() == 0;
+        if !left {
+            return false;
+        }
+        // Unhosted before dropped: a read resolver still holding a handle
+        // into an engine we are about to close would read a file nobody owns.
+        self.reads.unhost(id);
+        self.groups.remove(&id);
+        tracing::info!(shard, "released a shard this node no longer replicates");
+        true
     }
 
     /// Brings the peer links in line with the membership every group now says.
@@ -811,6 +886,10 @@ impl Driver {
             let _ = reply.send(AdminReply::ShardStatuses(self.shard_statuses()));
             return None;
         }
+        if let AdminOp::ReleaseShard { shard } = op {
+            let _ = reply.send(AdminReply::Released { released: self.release(shard) });
+            return None;
+        }
         let Some(hosted) = self.groups.get_mut(&group) else {
             let _ = reply.send(AdminReply::Rejected {
                 reason: format!("this node does not host group {group}"),
@@ -870,6 +949,14 @@ impl Group {
                 });
                 return;
             }
+            // Likewise, and necessarily: releasing a group means dropping it,
+            // and a group cannot drop itself out of the map that owns it.
+            AdminOp::ReleaseShard { .. } => {
+                let _ = reply.send(AdminReply::Rejected {
+                    reason: "a shard is released by the driver, not by its own group".into(),
+                });
+                return;
+            }
             AdminOp::LocalShardMap => {
                 let stored = crate::shard_map::encoded(&self.engine).unwrap_or_else(|e| {
                     tracing::error!(error = %e, "reading the local shard map");
@@ -890,6 +977,37 @@ impl Group {
             // receive from the leader and dial nobody — a node that can never
             // campaign once it is promoted.
             AdminOp::AddNode { id, address } => {
+                // **A shard group snapshots before it admits anybody**, and
+                // this is a correctness requirement, not a log-size one.
+                //
+                // A shard group is founded with no conf change at all: every
+                // replica derives the same voter set from map version 1, so
+                // nothing about that membership is ever written to the log.
+                // That is fine until somebody new joins — a newcomer caught up
+                // by the log tail replays only the *conf entries* it finds
+                // there, so it learns "4 is a learner, then a voter" on top of
+                // a base config of nobody, and ends up believing it is the
+                // sole voter of its own incarnation of the shard. M12.1's gate
+                // caught exactly that: node 4 reporting `replicas: {4}` for
+                // every shard it had been added to.
+                //
+                // A snapshot carries `ClusterConfig` (M8) precisely so a node
+                // caught up this way learns the membership with the state. So
+                // take one now: it truncates the prefix, the newcomer's
+                // `next_index` falls below `first_index`, and the leader has
+                // to send `InstallSnapshot` rather than entries. It is not a
+                // cost added to the migration either — the data has to cross
+                // the wire regardless, and this is the mechanism that moves
+                // it.
+                //
+                // The meta group needs none of this: a joining node is given
+                // `--peer` for the cluster as it stands, which is where its
+                // base config comes from, and M9's gate pins that path.
+                if group::shard_of(self.group).is_some()
+                    && let Err(e) = self.snapshot_now()
+                {
+                    tracing::error!(group = self.group, error = %e, "cannot snapshot before admitting a member");
+                }
                 let mut book = self.endpoints.clone();
                 book.insert(id, address);
                 ConfChange { op: ConfOp::AddLearner, node: id, context: encode_book(&book) }
@@ -1182,6 +1300,19 @@ impl Group {
         if self.applied_index == self.snapshot_index
             || self.applied_index < self.snapshot_index.saturating_add(self.snapshot_threshold)
         {
+            return Ok(());
+        }
+        self.snapshot_now()
+    }
+
+    /// Takes a snapshot regardless of the threshold.
+    ///
+    /// Two callers: [`Self::maybe_snapshot`], once the threshold trips, and
+    /// admitting a member to a **shard** group (M12.1), where it is a
+    /// correctness requirement rather than a log-size one. See
+    /// [`Self::handle_admin`] for why.
+    fn snapshot_now(&mut self) -> anyhow::Result<()> {
+        if self.applied_index == self.snapshot_index {
             return Ok(());
         }
         // An applied index always has a term: a live entry's, or the snapshot

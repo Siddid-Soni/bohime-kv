@@ -9,7 +9,7 @@ re-deriving the problem.
 is; neither is a defect list. This file is. Delete an entry when it is fixed,
 rather than annotating it.
 
-Last reviewed: 2026-09-18, at `e6a0c74` plus the uncommitted tick-loop work.
+Last reviewed: 2026-09-18, at `7a19b60` plus the uncommitted M12.1 work.
 
 ---
 
@@ -157,7 +157,63 @@ is why this is a note here rather than an edit there.
   had therefore never been exercised end to end by a benchmark until then.
   Treat any `get` figure in a plan doc dated before 2026-09-18 as void.
 
-## 8. Smaller things
+## 8. A removed replica keeps its shard's data forever
+
+**Found by M12.1's gate**, on its second run, and characterised exactly:
+node 2 holding a departed shard with `replicas [1, 2, 3, 4], leader None`.
+
+`kv-raft/src/node.rs:182`'s `replication_targets` is derived from the live
+config, and `RemoveVoter` takes effect when the entry is **appended** — so a
+leader stops replicating to the departing node strictly before the entry that
+removes it goes out. The departing node is left believing it is still a voter,
+with no leader and nobody to ask. It is not merely slow to find out; there is
+no path by which it ever can.
+
+M12.1's departure rule needs two witnesses before it deletes a shard's
+directories: the group's own committed config must exclude this node, and the
+published map must too. The second arrives routinely. The first cannot arrive
+at all for a node that was *removed*, so a node that loses a replica slot in a
+rebalance keeps that shard's Bitcask pair on disk indefinitely. Disk usage
+after a rebalance only grows.
+
+The mechanism is built and tested and does fire where the witness can arrive —
+`tests::shards::a_shard_is_deleted_only_when_both_witnesses_agree`,
+`tests::driver::{a_group_that_still_names_this_node_is_not_released,
+an_adopted_group_that_was_never_contacted_is_reclaimed}`. What is missing is
+the signal, and `tests::migrate::the_m12_1_gate` asserts the orphan is still
+there so that fixing this makes the gate fail rather than silently pass.
+
+Two ways to fix it, both bigger than M12.1 was:
+
+- **An explicit tombstone message** from the leader to the node it removed —
+  what TiKV does. A `kv-raft` message-shape change, which obliges re-running
+  the 100k-seed nemesis sweep (§4).
+- **A node-to-node control path**, so a replica whose map excludes a shard can
+  ask that shard's leader whether the group still contains it. No `kv-raft`
+  change, but a new cross-node admin call with leader discovery and retries,
+  and the in-process harness has no gRPC to test it over.
+
+## 9. A shard that never converges holds a migration slot indefinitely
+
+`--max-migrations` (default 4) caps the shards one node moves at once by
+taking the diverging ones in shard-id order. A shard whose learner never
+catches up, or whose leadership keeps changing, stays diverging forever and
+keeps consuming one of those slots, and nothing says so beyond the reconciler
+re-proposing every pass. Not *wrong* — the old replicas keep serving and the
+map stays published — but a rebalance can stall with no signal. A log line
+naming the shard and how long it has diverged is the cheap fix; the real one
+is M13's operational surface.
+
+## 10. A rebalance has never been benchmarked
+
+M12.1 moves shards by snapshot, and a shard group now takes a snapshot every
+time it admits a member. Nothing measures what that costs a cluster under
+load: not the pause on the group taking it, not the receiver's ingest, not the
+effect on foreground latency, and not how `--max-migrations` trades those
+against how long a rebalance takes. §7's warning applies in full — there is no
+control arm here yet.
+
+## 11. Smaller things
 
 - **`CLAUDE.md:237` is stale**: it says group commit is not implemented on the
   Raft log. `a62cc7c` implemented it. `CLAUDE.md` is gitignored
@@ -169,6 +225,13 @@ is why this is a note here rather than an edit there.
   surprise.
 - **The branch is named `m6-single-shard-node`** and contains M0 through
   M11.5. The name predates M7.
-- **`AdminService::Rebalance` and `VerifyShard` answer `unimplemented`** until
-  M12, and there is no admin CLI — membership changes go through gRPC
-  directly.
+- **`AdminService::VerifyShard` answers `unimplemented`** until M12.2, and
+  there is no admin CLI — membership changes go through gRPC directly.
+  `Rebalance` is implemented since M12.1: it runs this node's migration pass
+  now and answers with how many shards it leads that still differ from the
+  map.
+- **`CLAUDE.md` is stale about M12** as well as about group commit: it says
+  shard migration is absent, that a `--join` node's shards never arrive, and
+  that `Rebalance` is unimplemented. All three are wrong since M12.1. It is
+  gitignored (`.gitignore:8`), so this cannot be fixed by a commit — it has to
+  be fixed in each working copy.

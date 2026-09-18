@@ -135,6 +135,12 @@ impl ReadResolvers {
         self.groups.write().expect("read registry lock is never poisoned").insert(group, reads);
     }
 
+    /// Stops resolving reads for `group` (M12.1). Called before its engine is
+    /// closed: a resolver that kept its handle would read a file nobody owns.
+    pub(crate) fn unhost(&self, group: GroupId) {
+        self.groups.write().expect("read registry lock is never poisoned").remove(&group);
+    }
+
     /// Hands one confirmed read to the pool.
     ///
     /// Round-robin rather than least-loaded: the work is a lookup and a send,

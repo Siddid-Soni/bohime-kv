@@ -25,6 +25,7 @@ mod driver;
 mod kv_service;
 mod membership;
 mod meta;
+mod migrate;
 mod placement;
 mod read_engine;
 mod read_view;
@@ -228,11 +229,28 @@ async fn main() -> anyhow::Result<()> {
             Arc::clone(&published),
             routing.clone(),
             data.inbox.clone(),
+            data.admin.clone(),
             data.new_groups.clone(),
             shards::SUPERVISE_INTERVAL,
         )
         .run(),
     );
+
+    // And the migration driver, which closes the difference between the map
+    // and the shard groups this node leads. Every node runs one; a node that
+    // leads nothing proposes nothing. Held in an `Arc` because `AdminService`
+    // answers `Rebalance` by running a pass on this same driver.
+    let migrate = Arc::new(migrate::MigrationDriver::new(
+        config.clone(),
+        data.admin.clone(),
+        meta.admin.clone(),
+        Arc::clone(&published),
+        migrate::MIGRATE_INTERVAL,
+    ));
+    tokio::spawn({
+        let migrate = Arc::clone(&migrate);
+        async move { migrate.run_loop().await }
+    });
 
     tonic::transport::Server::builder()
         .add_service(RaftServiceServer::new(RaftServer::routing(routing)))
@@ -246,6 +264,7 @@ async fn main() -> anyhow::Result<()> {
             meta.requests.clone(),
             data.admin.clone(),
             Arc::clone(&published),
+            Arc::clone(&migrate),
         )))
         .serve(config.listen)
         .await?;

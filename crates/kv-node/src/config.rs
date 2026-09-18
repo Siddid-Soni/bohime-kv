@@ -111,6 +111,15 @@ pub struct NodeConfig {
     pub num_shards: u16,
     pub replication_factor: u8,
     pub vnodes_per_node: u32,
+    /// How many shards this node will move at once during a rebalance
+    /// (M12.1).
+    ///
+    /// Per node rather than per cluster: the expensive half of a move is one
+    /// receiver's snapshot ingest and its two Bitcask opens, and a cap on
+    /// each side bounds that without anybody coordinating. A node leading 154
+    /// shards moves this many at a time; moving many at once is how a
+    /// rebalance becomes an outage.
+    pub max_migrations: usize,
     /// How the **Raft log** reaches stable storage (see `--log-fsync`).
     ///
     /// Not the state machine's: a replicated state machine is durable through
@@ -331,6 +340,16 @@ pub struct Args {
     #[arg(long = "vnodes", default_value_t = kv_ring::DEFAULT_VNODES)]
     pub vnodes_per_node: u32,
 
+    /// Shards this node will move at once during a rebalance (M12.1).
+    ///
+    /// A rebalance is carried out by each shard's leader independently, so
+    /// there is no cluster-wide throttle to set — this bounds what one node
+    /// will start, and the receiving node's supervisor opens shards one at a
+    /// time on top of that. Raising it moves data faster and takes more of
+    /// the cluster's disk and network away from foreground traffic.
+    #[arg(long, default_value_t = 4)]
+    pub max_migrations: usize,
+
     /// Start as a learner waiting to be admitted, instead of as a founding
     /// member.
     ///
@@ -434,6 +453,7 @@ impl Args {
             num_shards: self.num_shards,
             replication_factor: self.replication_factor,
             vnodes_per_node: self.vnodes_per_node,
+            max_migrations: self.max_migrations,
             log_fsync: self.log_fsync.into(),
             state_fsync: self.state_fsync.into(),
         })

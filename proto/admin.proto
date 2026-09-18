@@ -77,6 +77,9 @@ message ShardStatus {
   uint64 term = 4;
   bool leading = 5;
   uint64 applied_index = 6;
+  // Replicating, not yet voting (M12.1). A shard mid-migration has the
+  // incoming replica here and the outgoing one still in `replicas`.
+  repeated uint64 learners = 7;
 }
 
 message GetShardMapRequest {
@@ -114,8 +117,15 @@ message GetShardMapResponse {
   repeated ShardReplicas shards = 6;
 }
 
+// A nudge, not a command: every node reconciles its own shards on its own
+// loop, and this runs that pass now. There is no rebalance coordinator to ask
+// — the map is the plan, and each shard's leader carries out its own part.
 message RebalanceRequest {}
-message RebalanceResponse {}
+message RebalanceResponse {
+  // Shards this node leads whose group does not yet match the map. Zero means
+  // this node is done, not that the cluster is.
+  uint32 diverging_shards = 1;
+}
 
 message VerifyShardRequest {
   uint32 shard_id = 1;

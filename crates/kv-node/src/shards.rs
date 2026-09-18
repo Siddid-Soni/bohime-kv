@@ -20,10 +20,10 @@ use std::time::Duration;
 use kv_raft::RaftNode;
 use kv_ring::{ShardId, ShardMap};
 use kv_storage::Engine;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::config::NodeConfig;
-use crate::driver::Group;
+use crate::driver::{AdminOp, AdminReply, AdminRequest, Group};
 use crate::meta::PublishedMap;
 use crate::placement;
 use crate::storage::BitcaskStorage;
@@ -43,11 +43,17 @@ pub struct ShardSupervisor {
     /// The shard driver's inbox, registered under each group so the
     /// `RaftService` can route to it.
     inbox: mpsc::Sender<Inbound>,
+    /// The shard driver's admin channel, for asking it to let a group go.
+    ///
+    /// The supervisor owns the disk; the driver owns the group. Neither can
+    /// delete a shard alone, and that split is what makes the two-witness
+    /// rule structural rather than a condition somebody can delete.
+    shard_admin: mpsc::Sender<AdminRequest>,
     groups: mpsc::Sender<Group>,
     interval: Duration,
     /// Shards already handed to the driver.
     hosted: BTreeSet<ShardId>,
-    /// Placement disagreements already reported, so the warning is said once
+    /// Shards reported as having moved away, so the warning is said once
     /// rather than twice a second forever.
     reported: BTreeSet<ShardId>,
 }
@@ -58,6 +64,7 @@ impl ShardSupervisor {
         published: PublishedMap,
         registry: GroupRegistry,
         inbox: mpsc::Sender<Inbound>,
+        shard_admin: mpsc::Sender<AdminRequest>,
         groups: mpsc::Sender<Group>,
         interval: Duration,
     ) -> Self {
@@ -66,6 +73,7 @@ impl ShardSupervisor {
             published,
             registry,
             inbox,
+            shard_admin,
             groups,
             interval,
             hosted: BTreeSet::new(),
@@ -80,7 +88,7 @@ impl ShardSupervisor {
         match placement::hosted_on_disk(&self.config) {
             Ok(shards) => {
                 for shard in shards {
-                    self.host(shard, None).await;
+                    self.host(shard, Origin::Reopen).await;
                 }
             }
             Err(e) => tracing::error!(error = %e, "cannot read the shards on disk"),
@@ -101,8 +109,78 @@ impl ShardSupervisor {
 
         match placement::founded_at(&self.config) {
             Ok(None) => self.found(&map).await,
-            Ok(Some(_)) => self.report_divergence(&map),
-            Err(e) => tracing::error!(error = %e, "cannot read the founding marker"),
+            Ok(Some(_)) => {}
+            Err(e) => {
+                tracing::error!(error = %e, "cannot read the founding marker");
+                return;
+            }
+        }
+
+        // Founding is a one-time act; adoption is not. Every pass after the
+        // first is the migration's receiving end: a shard the map has since
+        // placed here is one whose leader is about to add us as a learner,
+        // and a Raft message for a group this process does not host is
+        // answered `not_found` and retried. Hosting first means the retry
+        // lands.
+        self.adopt(&map).await;
+        self.release_departed(&map).await;
+    }
+
+    /// Lets go of every shard the map has moved away, if its group agrees.
+    ///
+    /// Three steps in this order and no other: ask the driver to drop the
+    /// group, which closes both Bitcask instances; stop routing to it; then
+    /// unlink. Unlinking while the driver still holds it removes files two
+    /// open engines are reading, and a node that crashed between the unlink
+    /// and the drop would come back up hosting a group with no data.
+    async fn release_departed(&mut self, map: &ShardMap) {
+        let departing: Vec<ShardId> =
+            self.hosted.iter().copied().filter(|&s| !map.holds(self.config.id, s)).collect();
+        for shard in departing {
+            let (reply, wait) = oneshot::channel();
+            let request = AdminRequest {
+                group: group::shard(shard),
+                op: AdminOp::ReleaseShard { shard },
+                reply,
+            };
+            if self.shard_admin.send(request).await.is_err() {
+                tracing::error!(shard, "the shard driver is gone; not releasing");
+                return;
+            }
+            match wait.await {
+                Ok(AdminReply::Released { released: true }) => {}
+                // The group still names this node. Ordinary between a map
+                // change and the conf change that carries it out — this node
+                // has not been removed from the group yet — and the next pass
+                // asks again.
+                Ok(_) => continue,
+                Err(_) => return,
+            }
+
+            self.registry.unregister(group::shard(shard));
+            self.hosted.remove(&shard);
+            self.reported.remove(&shard);
+            match std::fs::remove_dir_all(self.config.shard_dir(shard)) {
+                Ok(()) => tracing::info!(shard, version = map.version, "released a shard"),
+                Err(e) => tracing::error!(shard, error = %e, "cannot remove a released shard"),
+            }
+        }
+    }
+
+    /// Hosts every shard the map places here that we are not already hosting
+    /// (M12.1).
+    async fn adopt(&mut self, map: &ShardMap) {
+        let incoming: Vec<ShardId> =
+            map.shards_of(self.config.id).filter(|s| !self.hosted.contains(s)).collect();
+        for shard in incoming {
+            tracing::info!(shard, version = map.version, "adopting a shard the map placed here");
+            self.host(shard, Origin::Adopt).await;
+        }
+
+        for shard in self.hosted.clone() {
+            if !map.holds(self.config.id, shard) && self.reported.insert(shard) {
+                tracing::warn!(shard, "this node hosts a shard the map has moved away");
+            }
         }
     }
 
@@ -139,7 +217,7 @@ impl ShardSupervisor {
         let shards: Vec<ShardId> = map.shards_of(me).collect();
         tracing::info!(count = shards.len(), version = map.version, "founding shard groups");
         for shard in shards {
-            self.host(shard, Some(map)).await;
+            self.host(shard, Origin::Found { voters: map.replicas(shard).to_vec() }).await;
         }
         self.mark(map.version);
     }
@@ -152,42 +230,20 @@ impl ShardSupervisor {
         }
     }
 
-    /// Says once, per shard, where the map and this node disagree.
-    ///
-    /// Both directions are ordinary between a placement change and the
-    /// migration that carries it out, and both are M12's to resolve — but an
-    /// operator staring at a shard that is not where the map says needs to
-    /// see it named.
-    fn report_divergence(&mut self, map: &ShardMap) {
-        for shard in map.shards_of(self.config.id) {
-            if !self.hosted.contains(&shard) && self.reported.insert(shard) {
-                tracing::warn!(shard, "the map places this shard here but it is not hosted (M12)");
-            }
-        }
-        for &shard in &self.hosted {
-            if !map.holds(self.config.id, shard) && self.reported.insert(shard) {
-                tracing::warn!(shard, "this node hosts a shard the map has moved away (M12)");
-            }
-        }
-    }
-
     /// Opens one shard and hands it to the driver.
     ///
-    /// `map` is `Some` when founding — the group's initial voters are that
-    /// shard's replica set — and `None` when reopening a shard already on
-    /// disk, where the log and its snapshot own the membership and the
-    /// bootstrap config is history.
-    async fn host(&mut self, shard: ShardId, map: Option<&ShardMap>) {
+    /// See [`Origin`] for what the three cases mean: founding names the
+    /// shard's replica set, reopening takes what founding recorded, and
+    /// adopting deliberately names nobody.
+    async fn host(&mut self, shard: ShardId, origin: Origin) {
         if !self.hosted.insert(shard) {
             return;
         }
-        let voters: Vec<kv_raft::NodeId> =
-            map.map(|m| m.replicas(shard).to_vec()).unwrap_or_default();
         let config = self.config.clone();
         let group = group::shard(shard);
 
         // Blocking: two `open`s, each replaying or hint-loading a keydir.
-        let opened = tokio::task::spawn_blocking(move || open(&config, shard, group, &voters))
+        let opened = tokio::task::spawn_blocking(move || open(&config, shard, group, origin))
             .await
             .expect("opening a shard does not panic");
         let group_state = match opened {
@@ -213,13 +269,28 @@ impl ShardSupervisor {
     }
 }
 
+/// Why this group is being opened, which is what decides its bootstrap
+/// membership.
+///
+/// Three cases and no default, because the wrong one is silent. `Found` is the
+/// only one that may name voters; `Reopen` takes what founding recorded;
+/// `Adopt` deliberately takes **nothing**, because the membership of a group
+/// this node is being added to belongs to that group's leader and arrives by
+/// snapshot or by the conf entry that admits us.
+#[derive(Debug, Clone)]
+pub(crate) enum Origin {
+    Found { voters: Vec<kv_raft::NodeId> },
+    Adopt,
+    Reopen,
+}
+
 /// Opens one shard's log and state machine and builds its group. Synchronous
 /// and blocking — the caller runs it on a blocking thread.
-fn open(
+pub(crate) fn open(
     config: &NodeConfig,
     shard: ShardId,
     group: GroupId,
-    voters: &[kv_raft::NodeId],
+    origin: Origin,
 ) -> anyhow::Result<Group> {
     let raft_dir = config.shard_raft_dir(shard);
     let state_dir = config.shard_state_dir(shard);
@@ -227,11 +298,41 @@ fn open(
     std::fs::create_dir_all(&state_dir)?;
 
     let mut raft = config.raft_config_for(group);
-    if !voters.is_empty() {
-        // Founding: the shard's replica set is the group's membership, with
-        // ourselves filtered out the way `--peer` is.
-        raft.peers = voters.iter().copied().filter(|id| *id != config.id).collect();
+    match origin {
+        // The shard's replica set is the group's membership, with ourselves
+        // filtered out the way `--peer` is — and recorded, because no conf
+        // entry carries it and a reopen would otherwise fall back to flags.
+        Origin::Found { voters } => {
+            crate::placement::record_voters(config, shard, &voters)?;
+            raft.peers = voters.iter().copied().filter(|id| *id != config.id).collect();
+        }
+        // Whatever founding recorded, never `--peer`, which is the whole
+        // cluster where this group is three of it. No record means the group
+        // was adopted rather than founded, and an adopted group's membership
+        // is its leader's to supply — so it reopens the way it arrived.
+        Origin::Reopen => match crate::placement::founding_voters(config, shard)? {
+            Some(voters) if !voters.is_empty() => {
+                raft.peers = voters.iter().copied().filter(|id| *id != config.id).collect();
+            }
+            _ => {
+                raft.peers = Vec::new();
+                raft.initial_learner = true;
+            }
+        },
+        // The one that matters. `peers` empty and `initial_learner` true give
+        // `ClusterConfig { voters: {}, learners: {me} }`: this group cannot
+        // campaign (`kv-raft`'s campaign returns early for a non-voter) and
+        // cannot vote (granting requires `is_voter(self)`). It sits inert
+        // until its leader contacts it, which is the only correct state for a
+        // node that does not yet know this group's membership. Taking the
+        // flags instead would make a founder a voter of a config nobody
+        // agreed on, and a voter campaigns.
+        Origin::Adopt => {
+            raft.peers = Vec::new();
+            raft.initial_learner = true;
+        }
     }
+
     let node = RaftNode::new(raft, BitcaskStorage::open_with_policy(&raft_dir, config.log_fsync)?);
     let engine = Engine::open_with_config(&state_dir, config.engine_config())?;
     Ok(Group::new(config, group, node, engine))

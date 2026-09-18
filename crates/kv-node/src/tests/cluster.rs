@@ -36,7 +36,7 @@ use crate::meta::{MetaReconciler, PublishedMap};
 use crate::storage::BitcaskStorage;
 use crate::transport::group::{self, GroupId};
 use crate::transport::peer::SendError;
-use crate::transport::server::Inbound;
+use crate::transport::server::{GroupRegistry, Inbound};
 use crate::transport::{PeerFactory, PeerLink};
 
 pub(crate) const ALL: [NodeId; 3] = [1, 2, 3];
@@ -230,12 +230,25 @@ pub(crate) struct Cluster {
     /// published keydir copy and make the applied-but-not-yet-visible window
     /// deterministic.
     read_views: BTreeMap<NodeId, ReadViewFactory>,
+    /// Each supervised node's migration driver, so a test can run a pass on
+    /// demand rather than waiting out an interval.
+    migrators: BTreeMap<NodeId, Arc<crate::migrate::MigrationDriver>>,
     registry: Arc<Registry>,
     switchboard: Arc<Switchboard>,
     /// Kept alive for the driver's sake: dropping a node's inbox or peer-reply
     /// sender closes that `select!` arm under it.
     _keepalive: Vec<Box<dyn std::any::Any + Send>>,
     _dirs: Vec<tempfile::TempDir>,
+}
+
+/// The channels one running driver is reached on. Mirrors `main`'s own
+/// struct of the same name, for the same reason: a supervisor needs the inbox
+/// and the new-group sender as well as the request and admin ones.
+struct DriverHandles {
+    requests: mpsc::Sender<ClientRequest>,
+    admin: mpsc::Sender<AdminRequest>,
+    inbox: mpsc::Sender<Inbound>,
+    new_groups: mpsc::Sender<Group>,
 }
 
 /// How one node is configured when the harness starts it.
@@ -253,6 +266,14 @@ struct Spec {
     /// against the implementation production runs.
     keydir: kv_storage::IndexKind,
     snapshot_threshold: u64,
+    /// Run the real `ShardSupervisor` and `MigrationDriver` instead of
+    /// founding this node's shard groups in the harness (M12.1).
+    ///
+    /// The only mode in which a shard can arrive at, or leave, a running
+    /// node — and therefore the only one M12.1's own tests can use. Every
+    /// harness before it founds groups itself, which is precisely the code
+    /// path M12.1 replaces.
+    supervised: bool,
     /// The shards this node founds a Raft group for.
     ///
     /// Separate from `num_shards`, which is what the *map* describes. The
@@ -275,6 +296,7 @@ impl Cluster {
             meta_admin: BTreeMap::new(),
             published: BTreeMap::new(),
             read_views: BTreeMap::new(),
+            migrators: BTreeMap::new(),
             registry: Arc::new(Registry::default()),
             switchboard: Arc::new(Switchboard::default()),
             _keepalive: Vec::new(),
@@ -304,6 +326,7 @@ impl Cluster {
                 keydir: kv_storage::IndexKind::default(),
                 snapshot_threshold: u64::MAX,
                 shards: map.shards_of(id).collect(),
+                supervised: false,
             });
         }
         cluster
@@ -354,6 +377,7 @@ impl Cluster {
                 // beside the point here: these tests drive the driver, not
                 // the router.
                 shards: vec![0],
+                supervised: false,
             });
         }
         cluster
@@ -382,7 +406,77 @@ impl Cluster {
             // its AppendEntries. In production a shard reaching a new node is
             // a migration (M12); here the harness is the migration.
             shards: vec![0],
+            supervised: false,
         });
+    }
+
+    /// `nodes` nodes running the real supervisor and migration reconciler
+    /// (M12.1), founding their own shard groups from the map their own meta
+    /// group bootstraps.
+    ///
+    /// Awaits the first placement before returning, so a test starts
+    /// asserting rather than first waiting out an election.
+    pub(crate) async fn supervised(nodes: &[NodeId], num_shards: u16, rf: u8) -> Cluster {
+        let mut cluster = Cluster::empty(num_shards, rf);
+        for &id in nodes {
+            cluster.start(Spec {
+                id,
+                peers: nodes.iter().copied().filter(|&p| p != id).collect(),
+                joining: false,
+                lease_reads: false,
+                keydir: kv_storage::IndexKind::default(),
+                snapshot_threshold: u64::MAX,
+                // None: the supervisor founds them, which is the point.
+                shards: Vec::new(),
+                supervised: true,
+            });
+        }
+        cluster
+            .await_shard_map_on(nodes[0], Duration::from_secs(10))
+            .await
+            .expect("a supervised cluster bootstraps a map");
+        cluster
+    }
+
+    /// Starts a node that joins an existing supervised cluster: it founds
+    /// nothing, and its shards arrive by migration.
+    pub(crate) fn start_joining_supervised(&mut self, id: NodeId, members: &[NodeId]) {
+        self.start(Spec {
+            id,
+            peers: members.iter().copied().filter(|&p| p != id).collect(),
+            joining: true,
+            lease_reads: false,
+            keydir: kv_storage::IndexKind::default(),
+            snapshot_threshold: u64::MAX,
+            shards: Vec::new(),
+            supervised: true,
+        });
+    }
+
+    /// Runs node `id`'s migration pass now, as `AdminService::Rebalance`
+    /// does, and answers with what is still moving there.
+    pub(crate) async fn rebalance(&self, id: NodeId) -> usize {
+        self.migrators[&id].pass().await
+    }
+
+    /// Whether `id` hosts exactly `shards`, within `within`.
+    pub(crate) async fn await_hosted(
+        &self,
+        id: NodeId,
+        shards: &[ShardId],
+        within: Duration,
+    ) -> bool {
+        let want: BTreeSet<ShardId> = shards.iter().copied().collect();
+        let deadline = std::time::Instant::now() + within;
+        while std::time::Instant::now() < deadline {
+            let have: BTreeSet<ShardId> =
+                self.shard_statuses_of(id).await.into_iter().map(|s| s.shard).collect();
+            if have == want {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
     }
 
     fn start(&mut self, spec: Spec) {
@@ -405,6 +499,7 @@ impl Cluster {
             num_shards: self.num_shards,
             replication_factor: self.replication_factor,
             vnodes_per_node: kv_ring::DEFAULT_VNODES,
+            max_migrations: 4,
             log_fsync: crate::config::LogFsync::default().into(),
             state_fsync: crate::config::LogFsync::default().into(),
         };
@@ -423,31 +518,75 @@ impl Cluster {
         tokio::spawn(
             MetaReconciler::new(
                 config.clone(),
-                meta.1.clone(),
-                meta.0.clone(),
+                meta.admin.clone(),
+                meta.requests.clone(),
                 Arc::clone(&published),
                 Duration::from_millis(20),
             )
             .run(),
         );
 
-        self.requests.insert(spec.id, data.0);
-        self.admin.insert(spec.id, data.1);
-        self.meta_requests.insert(spec.id, meta.0);
-        self.meta_admin.insert(spec.id, meta.1);
+        if spec.supervised {
+            // The harness `Registry` routes by `(node, group)` and is what the
+            // `TestLink`s resolve through; the production `GroupRegistry` is
+            // what the supervisor writes. Register every shard group's inbox
+            // here up front — the data driver has one inbox for all of them —
+            // so a peer's message lands whether or not the supervisor has got
+            // to that shard yet. A message for a group the driver does not
+            // host is dropped, which is what the real transport's `not_found`
+            // becomes on this side of the wire.
+            for shard in 0..self.num_shards {
+                self.registry.register(spec.id, group::shard(shard), data.inbox.clone());
+            }
+            tokio::spawn(
+                crate::shards::ShardSupervisor::new(
+                    config.clone(),
+                    Arc::clone(&published),
+                    // The supervisor's own routing table. The harness routes
+                    // through `Registry` above instead, so nothing reads this
+                    // one — it exists because the production supervisor
+                    // registers and unregisters groups in it.
+                    GroupRegistry::default(),
+                    data.inbox.clone(),
+                    data.admin.clone(),
+                    data.new_groups.clone(),
+                    Duration::from_millis(20),
+                )
+                .run(),
+            );
+
+            let migrator = Arc::new(crate::migrate::MigrationDriver::new(
+                config.clone(),
+                data.admin.clone(),
+                meta.admin.clone(),
+                Arc::clone(&published),
+                Duration::from_millis(20),
+            ));
+            self.migrators.insert(spec.id, Arc::clone(&migrator));
+            tokio::spawn(async move { migrator.run_loop().await });
+        }
+
+        self.requests.insert(spec.id, data.requests);
+        self.admin.insert(spec.id, data.admin);
+        self.meta_requests.insert(spec.id, meta.requests);
+        self.meta_admin.insert(spec.id, meta.admin);
         self.published.insert(spec.id, published);
         self._dirs.push(dir);
     }
 
-    /// Starts one driver hosting `groups` on one node. Returns its request and
-    /// admin senders; the inbox and reply senders are parked in `_keepalive`,
-    /// because dropping either closes a `select!` arm under the driver.
+    /// Starts one driver hosting `groups` on one node.
+    ///
+    /// Returns its request and admin senders, plus the inbox and new-group
+    /// senders a supervisor needs to hand it shards at runtime (M12.1). The
+    /// reply sender is parked in `_keepalive`, because dropping it closes a
+    /// `select!` arm under the driver; so is a clone of each of the others,
+    /// for the same reason.
     fn start_driver(
         &mut self,
         spec: &Spec,
         config: &NodeConfig,
         groups: &[GroupId],
-    ) -> (mpsc::Sender<ClientRequest>, mpsc::Sender<AdminRequest>) {
+    ) -> DriverHandles {
         let (inbox_tx, inbox) = mpsc::channel(1024);
         let (replies_tx, replies) = mpsc::channel(1024);
         let (req_tx, req_rx) = mpsc::channel(64);
@@ -509,8 +648,8 @@ impl Cluster {
         );
         tokio::spawn(driver.run());
 
-        self._keepalive.push(Box::new((inbox_tx, replies_tx, groups_tx)));
-        (req_tx, admin_tx)
+        self._keepalive.push(Box::new((inbox_tx.clone(), replies_tx, groups_tx.clone())));
+        DriverHandles { requests: req_tx, admin: admin_tx, inbox: inbox_tx, new_groups: groups_tx }
     }
 
     pub(crate) fn switchboard(&self) -> &Arc<Switchboard> {
@@ -655,6 +794,53 @@ impl Cluster {
                     && among.contains(&leader)
                 {
                     return Some(leader);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        None
+    }
+
+    /// One admin request to one node's **shard** driver, naming the group
+    /// (M12.1). `admin` below names `group::DATA`, which is shard 0's — fine
+    /// while a harness hosts one shard and wrong the moment it hosts four.
+    pub(crate) async fn shard_admin(&self, id: NodeId, shard: ShardId, op: AdminOp) -> AdminReply {
+        let (reply, wait) = oneshot::channel();
+        self.admin[&id].send(AdminRequest { group: group::shard(shard), op, reply }).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), wait)
+            .await
+            .expect("the shard driver answers an admin request")
+            .expect("the shard driver does not drop it")
+    }
+
+    /// A membership change against whichever of `among` leads `shard`.
+    pub(crate) async fn administer_shard(
+        &self,
+        shard: ShardId,
+        among: &[NodeId],
+        op: impl Fn() -> AdminOp,
+    ) -> AdminReply {
+        for _ in 0..200 {
+            for &id in among {
+                match self.shard_admin(id, shard, op()).await {
+                    AdminReply::NotLeader { .. } => {}
+                    answered => return answered,
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("no node among {among:?} accepted a change to shard {shard} in 4s");
+    }
+
+    /// Whichever of `among` leads `shard`, once one does.
+    pub(crate) async fn leader_of_shard(&self, shard: ShardId, among: &[NodeId]) -> Option<NodeId> {
+        for _ in 0..200 {
+            for &id in among {
+                if let Some(status) =
+                    self.shard_statuses_of(id).await.into_iter().find(|s| s.shard == shard)
+                    && status.leading
+                {
+                    return Some(id);
                 }
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -865,6 +1051,43 @@ impl ClusterClient {
                 return None;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// One op against `shard`'s group, trying `among` in turn until one
+    /// answers properly (M12.1).
+    ///
+    /// Unlike `write_to_shard_with` this takes no map: key→shard and
+    /// shard→group never change, so a request routed this way survives
+    /// placement moving underneath it — which is the entire point during a
+    /// migration. `NotLeader` and `NotHosted` are both re-tries against the
+    /// next node, exactly as `kv-client` treats them.
+    pub(crate) async fn on_shard(
+        &self,
+        shard: ShardId,
+        op: impl Fn() -> ClientOp,
+        among: &[NodeId],
+        within: Duration,
+    ) -> Option<ClientReply> {
+        let group = group::shard(shard);
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            for &id in among {
+                let (reply, wait) = oneshot::channel();
+                if self.requests[&id].send(ClientRequest { group, op: op(), reply }).await.is_err()
+                {
+                    continue;
+                }
+                match tokio::time::timeout(Duration::from_millis(500), wait).await {
+                    Ok(Ok(ClientReply::NotLeader { .. } | ClientReply::NotHosted { .. })) => {}
+                    Ok(Ok(answered)) => return Some(answered),
+                    _ => {}
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 

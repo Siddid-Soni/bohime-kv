@@ -18,6 +18,7 @@ fn cfg(id: u64) -> NodeConfig {
         num_shards: 256,
         replication_factor: 3,
         vnodes_per_node: kv_ring::DEFAULT_VNODES,
+        max_migrations: 4,
         log_fsync: crate::config::LogFsync::default().into(),
         state_fsync: crate::config::LogFsync::default().into(),
     }
@@ -72,6 +73,7 @@ fn args(id: u64, peers: Vec<(u64, String)>) -> crate::config::Args {
         num_shards: 256,
         replication_factor: 1,
         vnodes_per_node: kv_ring::DEFAULT_VNODES,
+        max_migrations: 4,
         log_fsync: Default::default(),
         state_fsync: Default::default(),
     }
@@ -100,4 +102,25 @@ fn a_repeated_peer_is_an_error() {
     let repeated =
         vec![(2, "http://127.0.0.1:7002".to_string()), (2, "http://127.0.0.1:9999".to_string())];
     assert!(args(1, repeated).into_config().is_err());
+}
+
+/// `--max-migrations` is an operational knob with a conservative default:
+/// moving many shards at once is how a rebalance becomes an outage, and the
+/// cost lands on one receiver's snapshot ingest and its two Bitcask opens.
+///
+/// `--replication-factor 1` because `into_config` refuses a factor larger
+/// than the cluster in `--peer`, and this is a one-node command line.
+#[test]
+fn max_migrations_defaults_to_four_and_is_configurable() {
+    use clap::Parser;
+
+    let base = ["kv-node", "--id", "1", "--data-dir", "/tmp/x", "--replication-factor", "1"];
+
+    let config = crate::config::Args::try_parse_from(base).unwrap().into_config().unwrap();
+    assert_eq!(config.max_migrations, 4);
+
+    let mut with_flag = base.to_vec();
+    with_flag.extend(["--max-migrations", "16"]);
+    let config = crate::config::Args::try_parse_from(with_flag).unwrap().into_config().unwrap();
+    assert_eq!(config.max_migrations, 16);
 }

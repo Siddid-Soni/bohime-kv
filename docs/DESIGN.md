@@ -726,13 +726,45 @@ doing it earlier would be optimizing blind.
   unchanged.
 
 ### M12 — Rebalancing + Merkle verification  *(~2-3 sessions)*
-- Migration driver: learner-add → catch-up → promote → remove old, one shard
-  at a time, rate-limited.
+
+Split into **M12.1 (rebalancing, done)** and **M12.2 (Merkle, not started)**
+while it was built: the two ✅ criteria below are separately testable, and
+folding them into one plan meant the second could not be exercised until the
+first landed. Design docs in `docs/superpowers/specs/`.
+
+**M12.1 — shard migration (done).**
+- Migration driver: learner-add → catch-up → promote → remove old,
+  rate-limited by `--max-migrations` (default 4 shards per node at once).
+  `crates/kv-node/src/migrate.rs`.
+- The map is the *target*; each shard group's own committed Raft config is the
+  *state*. No migration plan is recorded anywhere: a shard is mid-migration
+  exactly when the two differ, which `ClusterStatus` already shows.
+- ✅ Add a node to a live 3-node cluster under load: data rebalances and no
+  request fails (`tests::migrate::the_m12_1_gate`). The Merkle half of the
+  original criterion belongs to M12.2; the gate asserts value-level agreement
+  in its place.
+- **Two things this turned up that the plan above did not anticipate**, both
+  consequences of founding a shard group with no conf change — its membership
+  is therefore written down nowhere:
+  - a *reopen* rebuilt the group's voter set from `--peer`, which is the whole
+    cluster rather than the shard's replicas. Founding now records it beside
+    the group (`shards/{id:05}/.voters`).
+  - a *newcomer* caught up by log tail replays only conf entries, so it
+    learned "I am a voter" on top of a base config of nobody. A shard group
+    now takes a snapshot before admitting anybody, because a snapshot carries
+    `ClusterConfig` and forces `InstallSnapshot` for the newcomer.
+- **Not delivered: reclaiming a departed replica's disk.** A removed replica
+  has no way to learn it was removed — the leader stops replicating to it
+  before the entry that removes it goes out — so the data stays. See
+  `docs/KNOWN-ISSUES.md` §8.
+
+**M12.2 — Merkle verification (not started).**
 - Merkle tree over each shard's keyspace at an applied index;
   `AdminService::VerifyShard` compares roots and descends on mismatch.
-- ✅ Add a node to a live 3-node cluster under load: data rebalances, no
-  request fails, Merkle roots agree across every replica of every shard
-  afterwards.
+  Comparability is the hard part: two replicas scanning at different applied
+  indexes always differ, so the roots have to be computed at a barrier entry
+  in the shard's own log.
+- ✅ Merkle roots agree across every replica of every shard after a rebalance.
 - ✅ Deliberately corrupt one replica's segment file → verification detects
   it and names the divergent key range.
 

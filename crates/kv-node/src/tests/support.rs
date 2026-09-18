@@ -47,6 +47,7 @@ pub(crate) fn config_in(dir: &std::path::Path) -> crate::config::NodeConfig {
         num_shards: 256,
         replication_factor: 1,
         vnodes_per_node: kv_ring::DEFAULT_VNODES,
+        max_migrations: 4,
         log_fsync: crate::config::LogFsync::default().into(),
         state_fsync: crate::config::LogFsync::default().into(),
     };

@@ -374,3 +374,77 @@ async fn every_shard_elects_a_leader_when_one_loop_drives_many() {
     let leaders = cluster.await_shard_leaders(&NODES, Duration::from_secs(30)).await;
     assert_eq!(leaders.len(), 256, "not every shard elected: {leaders:?}");
 }
+
+/// A learner added to a shard group shows up in that shard's status.
+///
+/// The migration reconciler's entire comparison is group-members against
+/// map-replicas, and a learner it cannot see is a node it proposes to add
+/// again on every pass — a conf entry per pass, every one of them refused.
+#[tokio::test]
+async fn a_shard_status_names_its_learners() {
+    use crate::driver::{AdminOp, AdminReply};
+    use crate::tests::cluster::Cluster;
+
+    let mut cluster = Cluster::sharded(&[1, 2, 3], 4, 3);
+    let leader = cluster.leader_of_shard(0, &[1, 2, 3]).await.expect("a leader for shard 0");
+
+    cluster.start_joining_node(4, &[1, 2, 3]);
+    let reply = cluster
+        .administer_shard(0, &[1, 2, 3], || AdminOp::AddNode {
+            id: 4,
+            address: "in-process://4".into(),
+        })
+        .await;
+    assert!(matches!(reply, AdminReply::Accepted { .. }), "adding a learner: {reply:?}");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = cluster
+            .shard_statuses_of(leader)
+            .await
+            .into_iter()
+            .find(|s| s.shard == 0)
+            .expect("the leader hosts shard 0");
+        if status.learners == vec![4] || status.replicas.contains(&4) {
+            assert_eq!(status.learners, vec![4], "node 4 is a learner, not a voter yet");
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "shard 0 never reported node 4: {status:?}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A group that has *committed* this node out of its config releases.
+///
+/// The other half of the witness rule, and it needs a real cluster: a
+/// committed `RemoveVoter` is the only way a group's config ever stops naming
+/// somebody, and the node being removed learns it from the entry that does it.
+#[tokio::test]
+async fn a_group_whose_config_dropped_us_is_released() {
+    use crate::driver::{AdminOp, AdminReply};
+    use crate::tests::cluster::Cluster;
+
+    let cluster = Cluster::sharded(&[1, 2, 3], 4, 3);
+    assert!(cluster.leader_of_shard(0, &[1, 2, 3]).await.is_some(), "shard 0 elects a leader");
+
+    let reply = cluster.administer_shard(0, &[1, 2, 3], || AdminOp::RemoveNode { id: 3 }).await;
+    assert!(
+        matches!(reply, AdminReply::Accepted { .. }),
+        "removing node 3 from shard 0: {reply:?}"
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let AdminReply::Released { released: true } =
+            cluster.shard_admin(3, 0, AdminOp::ReleaseShard { shard: 0 }).await
+        {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "node 3 never released shard 0");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        !cluster.shard_statuses_of(3).await.iter().any(|s| s.shard == 0),
+        "node 3 still hosts a shard it was removed from"
+    );
+}

@@ -132,6 +132,7 @@ fn three_node_config(dir: &std::path::Path) -> NodeConfig {
         num_shards: 256,
         replication_factor: 3,
         vnodes_per_node: kv_ring::DEFAULT_VNODES,
+        max_migrations: 4,
         log_fsync: batching(),
         state_fsync: crate::config::LogFsync::default().into(),
     };

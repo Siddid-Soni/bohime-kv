@@ -28,6 +28,16 @@ use crate::config::NodeConfig;
 /// a half-wiped store is worse than a wiped one.
 const MARKER: &str = ".placement";
 
+/// One shard's founding voter set, inside that shard's own directory.
+///
+/// `.placement` records *which map version* this node founded from; this
+/// records *what that map said about this shard*. They are separate because
+/// the second has to survive the first being superseded: a founded group has
+/// no conf entry to replay its membership from, so without this the bootstrap
+/// config on reopen is `--peer` — the whole cluster rather than the shard's
+/// three replicas, which is a quorum nobody agreed on.
+const VOTERS: &str = ".voters";
+
 /// A store written before M11: one Raft log and one state machine holding
 /// keys from every shard.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -119,4 +129,52 @@ pub fn hosted_on_disk(config: &NodeConfig) -> anyhow::Result<BTreeSet<ShardId>> 
         shards.insert(shard);
     }
     Ok(shards)
+}
+
+fn voters_path(config: &NodeConfig, shard: ShardId) -> PathBuf {
+    config.shard_dir(shard).join(VOTERS)
+}
+
+/// Records the voter set `shard`'s group was founded with.
+///
+/// Fsynced, and written before the group is handed to the driver, for the same
+/// reason [`record_founding`] is: a directory that survived a crash its record
+/// did not would be reopened with a membership nobody agreed on.
+pub fn record_voters(
+    config: &NodeConfig,
+    shard: ShardId,
+    voters: &[kv_raft::NodeId],
+) -> anyhow::Result<()> {
+    let path = voters_path(config, shard);
+    let text = voters.iter().map(|id| id.to_string()).collect::<Vec<_>>().join("\n");
+    std::fs::write(&path, format!("{text}\n"))?;
+    std::fs::File::open(&path)?.sync_all()?;
+    Ok(())
+}
+
+/// The voter set `shard` was founded with, or `None` for a shard that was
+/// adopted rather than founded — or founded by a binary that predates this
+/// file.
+///
+/// `None` is not an error. An adopted group learns its config from the leader
+/// that added it, which is the only correct source for a group this node was
+/// admitted to rather than founded.
+pub fn founding_voters(
+    config: &NodeConfig,
+    shard: ShardId,
+) -> anyhow::Result<Option<Vec<kv_raft::NodeId>>> {
+    let path = voters_path(config, shard);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            let mut voters = Vec::new();
+            for field in text.split_whitespace() {
+                voters.push(field.parse::<kv_raft::NodeId>().map_err(|e| {
+                    anyhow::anyhow!("{} holds {field:?}, not a node id: {e}", path.display())
+                })?);
+            }
+            Ok(Some(voters))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
