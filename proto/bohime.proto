@@ -1,0 +1,72 @@
+syntax = "proto3";
+package bohime;
+
+service Kv {
+  rpc Call(Command) returns (Reply);
+}
+
+service Raft {
+  rpc Send(Batch) returns (Empty);
+}
+
+enum Op {
+  GET = 0;
+  PUT = 1;
+  DELETE = 2;
+}
+
+// A client request, and also the payload of a log entry: reads go through
+// the log too, which is what makes them linearizable.
+message Command {
+  Op op = 1;
+  bytes key = 2;
+  bytes value = 3;
+}
+
+// `ok` false means "not here": retry at `leader`, or anywhere if it is empty.
+message Reply {
+  bool ok = 1;
+  optional bytes value = 2;
+  string leader = 3;
+}
+
+message Entry {
+  uint64 term = 1;
+  Command cmd = 2; // absent for the no-op a new leader appends
+}
+
+enum Kind {
+  VOTE = 0;
+  VOTE_RESP = 1;
+  APPEND = 2;
+  APPEND_RESP = 3;
+}
+
+// One flat message for all four Raft RPCs. `index`/`log_term` are the
+// candidate's last entry (VOTE) or the entry preceding `entries` (APPEND);
+// in APPEND_RESP `index` is the follower's match index, or on failure a hint
+// of where the leader should back up to.
+message Msg {
+  Kind kind = 1;
+  uint32 shard = 2;
+  uint64 from = 3;
+  uint64 to = 4;
+  uint64 term = 5;
+  uint64 index = 6;
+  uint64 log_term = 7;
+  repeated Entry entries = 8;
+  uint64 commit = 9;
+  bool success = 10;
+}
+
+message Batch {
+  repeated Msg msgs = 1;
+}
+
+message Empty {}
+
+message HardState {
+  uint64 term = 1;
+  uint64 voted_for = 2;
+  uint64 last = 3; // log length; entries past it on disk are dead
+}

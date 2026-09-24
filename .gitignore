@@ -6,3 +6,4 @@ Cargo.lock
 *.bohime
 .gitignore
 CLAUDE.md
+.worktrees/

@@ -4,9 +4,6 @@ on:
   push:
     branches: [master]
   pull_request:
-  schedule:
-    # Nightly, for the 100k-seed sweep — see the `sweep` job.
-    - cron: '0 3 * * *'
   workflow_dispatch:
 
 env:
@@ -17,96 +14,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-
       - uses: Swatinem/rust-cache@v2
-
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@cargo-nextest
-
-      - name: fmt
-        run: cargo fmt --all -- --check
-
-      - name: clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-
-      - name: test
-        run: cargo nextest run --workspace
-
-      # The read path submits through io_uring where the kernel allows it and
-      # falls back to pread otherwise. Which one a given runner takes is not
-      # ours to decide — hosted runners, containers and seccomp profiles all
-      # vary, and `io_uring_disabled` is set on plenty of production hosts. So
-      # the fallback is gated explicitly rather than left to whichever path the
-      # runner happens to pick, because an untested fallback is not a fallback.
-      - name: test (blocking read path)
-        env:
-          BOHIME_READ_ENGINE: blocking
-        run: cargo nextest run --workspace
-
-      # M4's reproducibility dies silently if a pure crate gains an async
-      # runtime, and nothing else in CI would notice. kv-ring joined the list
-      # at M10: placement is a pure function of the node set, and M11's
-      # simulator has to be able to call it.
-      - name: the pure crates stay free of tokio
-        run: |
-          for crate in kv-raft kv-ring kv-sim; do
-            if cargo tree -p "$crate" -e normal | grep -q tokio; then
-              echo "::error::$crate depends on tokio; the deterministic simulator requires it not to"
-              exit 1
-            fi
-          done
-
-      # M11.5's keydir is behind a flag, so both settings are real
-      # configurations and both have to work. The suite above runs the
-      # default; this runs the comparison arm's own tests, which is what
-      # keeps `--keydir locked` from rotting into a type that compiles.
-      - name: test (locked keydir)
-        run: cargo nextest run -p kv-node -E 'test(wait_free_reads)'
-
-      # The loom model needs the whole of kv-storage built with `--cfg loom`
-      # so that left-right's atomics are loom's rather than std's; without it
-      # the model explores almost nothing. That also means every other test
-      # in the crate is `cfg(not(loom))`, so this is a separate build and a
-      # separate run rather than part of the suite above.
-      - name: loom model (keydir)
-        env:
-          RUSTFLAGS: --cfg loom
-        run: cargo test -p kv-storage --lib loom_index
-
-      # The 10k-seed election gate is ~2s, so it runs on every push. The
-      # 100k-seed nemesis gate takes ~80 minutes and runs nightly instead —
-      # see the `sweep` job.
-      - name: election gate (10k seeds)
-        run: cargo nextest run -p kv-sim --run-ignored all -E 'test(election_sweep_full)'
-
-  # M4's full nemesis gate: 100k seeds, ~80 minutes. Far too slow to gate a
-  # push, but it is the milestone's headline claim and has caught real bugs,
-  # so it runs nightly and on demand rather than not at all.
-  sweep:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    timeout-minutes: 180
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@cargo-nextest
-
-      - name: nemesis gate (100k seeds)
-        run: cargo nextest run --release -p kv-sim --run-ignored all -E 'test(nemesis_sweep_full)'
+      - uses: taiki-e/install-action@cargo-nextest
+      - run: cargo fmt -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo nextest run

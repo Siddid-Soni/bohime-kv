@@ -1,8 +1,0 @@
-# Seeds for failure cases proptest has generated in the past. It is
-# automatically read and these particular cases re-run before any
-# novel cases are generated.
-#
-# It is recommended to check this file in to source control so that
-# everyone who runs the test benefits from these saved cases.
-cc c935d9fd0eeaf2de7ad2368d75ae996bb57cb129ed110397a4e597b334ee6cca # shrinks to msg = AppendEntriesResp { term: 0, success: false, match_index: 1, conflict_term: None, conflict_index: None }
-cc c39f155b96c7e8f9bd733e66993c4d1fa34b70abf262af5cd184f4af70387503 # shrinks to msg = AppendEntries { term: 0, leader_id: 0, prev_log_index: 0, prev_log_term: 0, entries: [], leader_commit: 0, read_round: Some(0) }

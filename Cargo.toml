@@ -1,54 +1,21 @@
-[workspace]
-resolver = "3"
-members = ["crates/*"]
-
-[workspace.package]
+[package]
+name = "bohime"
+version = "0.1.0"
 edition = "2024"
 license = "MIT"
 publish = false
 
-[workspace.dependencies]
-kv-proto = { path = "crates/kv-proto" }
-kv-storage = { path = "crates/kv-storage" }
-kv-raft = { path = "crates/kv-raft" }
-kv-ring = { path = "crates/kv-ring" }
-kv-client = { path = "crates/kv-client" }
-kv-sim = { path = "crates/kv-sim" }
-
-tokio = { version = "1", features = ["full"] }
-tokio-stream = "0.1"
-tonic = "0.13"
-tonic-build = "0.13"
-prost = "0.13"
-bytes = "1"
-serde = { version = "1", features = ["derive"] }
-bincode = "1"
-thiserror = "2"
-anyhow = "1"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-crc32fast = "1"
-rand = "0.8"
+[dependencies]
 clap = { version = "4", features = ["derive"] }
-left-right = "0.11"
-arc-swap = "1"
-# The read path submits preads through io_uring where the kernel allows it and
-# falls back to pread otherwise (see kv-node/src/read_engine.rs). `libc` is for
-# the fallback's pread and for probing ring availability.
-io-uring = "0.6"
-libc = "0.2"
+crc32fast = "1"
+prost = "0.13"
+rand = "0.8"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = "0.13"
 
-proptest = "1"
+[build-dependencies]
+tonic-build = "0.13"
+
+[dev-dependencies]
 tempfile = "3"
-criterion = "0.5"
-assert_cmd = "2"
-loom = "0.7"
-# The third arm of M11.5's keydir scaling benchmark, beside RwLock<HashMap>
-# and left-right. Benchmark-only: nothing in the engine uses it.
-dashmap = "6"
-
-[profile.release]
-lto = true
-
-[profile.bench]
-inherits = "release"
