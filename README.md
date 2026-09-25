@@ -1,8 +1,8 @@
 # Bohime
 
 A sharded, Raft-replicated key-value store in Rust over gRPC, kept as small as
-it can be: a single-file Bitcask, Raft with elections and log replication
-only, and fixed hash sharding. About 770 lines of Rust in one crate.
+it can be: one node per shard replica, a single-file Bitcask, Raft with elections and log replication
+only, and fixed hash sharding. About 830 lines of Rust in one crate.
 
 The full-featured version (snapshots, membership changes, a meta group,
 shard migration, wait-free reads, a deterministic simulator) lives on the
@@ -34,39 +34,41 @@ $B get color          # (not found), exit code 1
 |---|---|---|
 | `--id` | required | this node's id (ids start at 1) |
 | `--node id=host:port` | required | every node in the cluster, this one included |
-| `--shards` | 16 | number of shards |
-| `--rf` | 3 | replicas per shard, between 1 and the node count |
+| `--rf` | 3 | replicas per shard; the node count must be a multiple of it |
 | `--data-dir` | required | where this node's data file lives |
 | `--tick-ms` | 50 | Raft tick; heartbeats go out every tick |
 
-Every node must get the same `--node` list, `--shards` and `--rf`. Placement
+Every node must get the same `--node` list and `--rf`. Placement
 is computed from them and never changes.
 
 ## How it works
 
 ```
 client ──Kv.Call──▶ any node ──redirect──▶ shard leader
-                                              │ propose
-                                              ▼
-                     ┌─────────── one loop per node ────────────┐
-                     │ shard 0 Raft │ shard 3 Raft │ shard 7 Raft │ ...
-                     └───────┬──────────────────────────┬────────┘
-                             │ persist, fsync once       │ Raft.Send(Batch)
-                             ▼                           ▼
-                        one Bitcask file            peer nodes
+
+     shard 0                  shard 1                  shard 2
+ ┌──────┬──────┬──────┐  ┌──────┬──────┬──────┐  ┌──────┬──────┬──────┐
+ │node 1│node 2│node 3│  │node 4│node 5│node 6│  │node 7│node 8│node 9│
+ └──────┴──────┴──────┘  └──────┴──────┴──────┘  └──────┴──────┴──────┘
+   one Raft group           one Raft group           one Raft group
+   each node: one loop, one data file, fsync per batch
 ```
 
-- **Sharding.** A key's shard is `fnv1a(key) % shards`. Shard `s` lives on the
-  `rf` nodes that follow position `s` in the sorted id list, so each node
-  holds about `shards * rf / nodes` shards.
-- **Replication.** Every shard is its own Raft group. One loop per node ticks
-  all of them. Raft itself (`src/raft.rs`) does no I/O: it changes state and
-  queues messages, and the node persists and sends them.
+- **Sharding.** Each node is one replica of one shard. The sorted node ids
+  are cut into runs of `rf`, one shard per run, so 9 nodes at RF 3 make 3
+  shards. A key's shard is `fnv1a(key) % shards`; a node that gets a key of
+  another shard redirects to one of that shard's nodes.
+- **Replication.** Every shard is its own Raft group over its `rf` nodes, so
+  shards share nothing and scale by adding `rf` nodes. Raft itself
+  (`src/raft.rs`) does no I/O: it changes state and queues messages, and the
+  node persists and sends them.
 - **Reads go through the log**, the same as writes. A read is answered once
   its entry commits and is applied, so it is linearizable.
-- **Durability.** Each loop iteration writes every group's new log entries
-  and votes, calls fsync once, and only then sends messages and answers
-  clients. Nothing is acknowledged before it is on disk.
+- **Durability.** A node writes its new log entries and vote as one
+  batch and fsyncs it on a separate thread, meanwhile taking in more
+  requests for the next batch. Only when the fsync returns does it send that
+  batch's messages and answer its clients. Nothing is acknowledged before it
+  is on disk.
 - **Storage.** One append-only file per node. Each record is
   `crc32 | key_len | value_len | key | value`, and a `value_len` of
   `u32::MAX` marks a delete. An in-memory index maps each key to its latest
@@ -89,11 +91,11 @@ client ──Kv.Call──▶ any node ──redirect──▶ shard leader
 - **Detection** is Raft's timers only. The leader sends a heartbeat every
   tick (50ms). A follower that hears nothing for a random 10-20 ticks
   (0.5-1s) starts an election.
-- **A crashed node** loses nothing it acknowledged. The shards it led elect
-  new leaders among their remaining replicas, as long as a majority of each
-  shard's replicas is up.
+- **A crashed node** loses nothing it acknowledged. If it led its shard, the
+  shard elects a new leader among its remaining nodes, as long as a majority
+  of them is up.
 - **When a node comes back**, it cuts off any half-written record at the end
-  of its file and reloads each shard's term, vote and log. The leader then
+  of its file and reloads its term, vote and log. The leader then
   sends it the entries it missed, up to 256 per heartbeat, and it rebuilds
   its data by replaying the log from the start.
 - **A client** tries any node, follows redirects to the leader, and retries

@@ -3,7 +3,8 @@
 //!
 //! Record: `crc32 | key_len u32 | value_len u32 | key | value`, little endian.
 //! A `value_len` of `u32::MAX` marks a tombstone. There is no compaction: the
-//! file only grows.
+//! file only grows. Records are buffered in memory until `flush`, so a batch
+//! of them costs one write.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -20,7 +21,10 @@ type Record<'a> = (&'a [u8], Option<&'a [u8]>, usize);
 pub struct Bitcask {
     file: File,
     keydir: HashMap<Vec<u8>, (u64, u32)>,
+    /// Offset just past the last record, buffered ones included.
     end: u64,
+    /// Records not yet written; the first sits at `end - buf.len()`.
+    buf: Vec<u8>,
 }
 
 impl Bitcask {
@@ -31,7 +35,7 @@ impl Bitcask {
         let file =
             OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;
         let data = std::fs::read(path)?;
-        let mut db = Self { file, keydir: HashMap::new(), end: 0 };
+        let mut db = Self { file, keydir: HashMap::new(), end: 0, buf: vec![] };
         while let Some((key, value, len)) = decode(&data[db.end as usize..]) {
             db.index(key, value.map(|v| v.len()), len);
         }
@@ -41,8 +45,13 @@ impl Bitcask {
 
     pub fn get(&self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
         let Some(&(offset, len)) = self.keydir.get(key) else { return Ok(None) };
-        let mut value = vec![0; len as usize];
-        self.file.read_exact_at(&mut value, offset)?;
+        let (offset, len) = (offset as usize, len as usize);
+        let written = self.end as usize - self.buf.len();
+        if offset >= written {
+            return Ok(Some(self.buf[offset - written..][..len].to_vec()));
+        }
+        let mut value = vec![0; len];
+        self.file.read_exact_at(&mut value, offset as u64)?;
         Ok(Some(value))
     }
 
@@ -54,15 +63,30 @@ impl Bitcask {
         self.append(key, None)
     }
 
+    /// Hands the buffered records to the OS in one write.
+    pub fn flush(&mut self) -> io::Result<()> {
+        let written = self.end - self.buf.len() as u64;
+        self.file.write_all_at(&self.buf, written)?;
+        self.buf.clear();
+        Ok(())
+    }
+
     /// Writes are not durable until this returns.
-    pub fn sync(&self) -> io::Result<()> {
+    pub fn sync(&mut self) -> io::Result<()> {
+        self.flush()?;
         self.file.sync_data()
     }
 
+    /// A handle to fsync on another thread, after `flush`, while this one
+    /// keeps buffering.
+    pub fn file(&self) -> io::Result<File> {
+        self.file.try_clone()
+    }
+
     fn append(&mut self, key: &[u8], value: Option<&[u8]>) -> io::Result<()> {
-        let record = encode(key, value);
-        self.file.write_all_at(&record, self.end)?;
-        self.index(key, value.map(|v| v.len()), record.len());
+        let len = self.buf.len();
+        encode(&mut self.buf, key, value);
+        self.index(key, value.map(|v| v.len()), self.buf.len() - len);
         Ok(())
     }
 
@@ -80,15 +104,16 @@ impl Bitcask {
     }
 }
 
-fn encode(key: &[u8], value: Option<&[u8]>) -> Vec<u8> {
-    let mut record = vec![0; 4];
-    record.extend((key.len() as u32).to_le_bytes());
-    record.extend(value.map_or(TOMBSTONE, |v| v.len() as u32).to_le_bytes());
-    record.extend(key);
-    record.extend(value.unwrap_or_default());
-    let crc = crc32fast::hash(&record[4..]);
-    record[..4].copy_from_slice(&crc.to_le_bytes());
-    record
+/// Appends one record to `buf`.
+fn encode(buf: &mut Vec<u8>, key: &[u8], value: Option<&[u8]>) {
+    let start = buf.len();
+    buf.extend([0; 4]);
+    buf.extend((key.len() as u32).to_le_bytes());
+    buf.extend(value.map_or(TOMBSTONE, |v| v.len() as u32).to_le_bytes());
+    buf.extend(key);
+    buf.extend(value.unwrap_or_default());
+    let crc = crc32fast::hash(&buf[start + 4..]);
+    buf[start..start + 4].copy_from_slice(&crc.to_le_bytes());
 }
 
 /// `None` if `buf` does not start with a whole, intact record.

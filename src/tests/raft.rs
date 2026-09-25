@@ -171,3 +171,58 @@ fn a_restarted_follower_catches_up_from_its_persisted_log() {
     assert_eq!(c.node(follower).log, log);
     assert!(c.node(follower).commit >= last);
 }
+
+#[test]
+fn an_entry_is_sent_to_a_follower_once_while_unacknowledged() {
+    let mut c = Cluster::new(3);
+    let leader = c.elect();
+    c.node(leader).propose(put("a"));
+    c.node(leader).broadcast();
+    c.node(leader).propose(put("b"));
+    c.node(leader).broadcast();
+    c.node(leader).tick();
+    let to = peers(leader, 3)[0];
+    let sent: Vec<_> = c.node(leader).outbox.iter().filter(|m| m.to == to).collect();
+    let entries: usize = sent.iter().map(|m| m.entries.len()).sum();
+    assert_eq!(entries, 2, "{sent:?}");
+}
+
+#[test]
+fn a_lost_append_is_resent() {
+    let mut c = Cluster::new(3);
+    let leader = c.elect();
+    let index = c.node(leader).propose(put("k")).unwrap();
+    c.node(leader).broadcast();
+    c.node(leader).outbox.clear();
+    c.tick(3);
+    for n in &c.nodes {
+        assert!(n.commit >= index, "node {} commit {}", n.id, n.commit);
+        assert_eq!(key_at(n, index), Some(b"k".to_vec()));
+    }
+}
+
+#[test]
+fn an_append_is_capped_at_a_megabyte_but_carries_at_least_one_entry() {
+    let mut c = Cluster::new(3);
+    let leader = c.elect();
+    let value =
+        |kb: usize| Command { op: Op::Put as i32, key: b"k".to_vec(), value: vec![0; kb << 10] };
+    let to = peers(leader, 3)[0];
+    let sent = |r: &Raft| -> Vec<usize> {
+        r.outbox.iter().filter(|m| m.to == to).map(|m| m.entries.len()).collect()
+    };
+
+    c.node(leader).propose(value(2048));
+    c.node(leader).broadcast();
+    assert_eq!(sent(c.node(leader)), [1], "an entry over the cap still goes");
+    c.deliver();
+
+    for _ in 0..10 {
+        c.node(leader).propose(value(300));
+    }
+    c.node(leader).broadcast();
+    assert_eq!(sent(c.node(leader)), [3], "three 300 KB entries fit in 1 MB, four do not");
+    c.tick(10);
+    let log = c.node(leader).log.clone();
+    assert_eq!(c.node(to).log, log, "the rest follows on later broadcasts");
+}

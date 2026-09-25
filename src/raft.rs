@@ -4,15 +4,18 @@
 //! `voted_for` and `log[stable..]`, then sends, then applies up to `commit`.
 
 use crate::pb::{Command, Entry, Kind, Msg};
+use prost::Message;
 use rand::Rng;
 use std::collections::{HashMap, HashSet};
 
 /// Election timeout, in ticks, drawn from `[ELECTION_TICKS, 2 * ELECTION_TICKS)`.
 /// The leader heartbeats every tick.
 const ELECTION_TICKS: u64 = 10;
-/// Most entries sent in one append, so a far-behind follower catches up in
-/// bounded steps.
+/// Most entries, and bytes of them, sent in one append, so a far-behind
+/// follower catches up in bounded steps and no append outlasts the peer RPC
+/// timeout. An entry larger than `MAX_BYTES` still goes, alone.
 const MAX_BATCH: usize = 256;
+const MAX_BYTES: usize = 1 << 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
@@ -216,9 +219,22 @@ impl Raft {
         }
     }
 
+    /// Sends what `to` has not been sent yet and assumes it arrives: resending
+    /// every unacknowledged entry on each broadcast swamps the link under
+    /// load. A lost append is noticed when the next one is rejected.
     fn send_append(&mut self, to: u64) {
         let next = self.next[&to] as usize;
-        let entries = self.log[next..].iter().take(MAX_BATCH).cloned().collect();
+        let mut bytes = 0;
+        let entries: Vec<Entry> = self.log[next..]
+            .iter()
+            .take(MAX_BATCH)
+            .take_while(|e| {
+                bytes += e.encoded_len();
+                bytes <= MAX_BYTES || bytes == e.encoded_len()
+            })
+            .cloned()
+            .collect();
+        self.next.insert(to, (next + entries.len()) as u64);
         let m = Msg {
             kind: Kind::Append as i32,
             to,
